@@ -102,6 +102,7 @@ Articles : [Qwen3-ASR](https://arxiv.org/abs/2601.21337) (Alibaba) · [Qwen3-TTS
 
 ## Actualites
 
+- **10 sept. 2026** -- [NVIDIA Nemotron VoiceChat sur Apple Silicon -- parole full-duplex avec outils](https://blog.ivan.digital/nvidia-nemotron-voicechat-on-apple-silicon-full-duplex-speech-with-tools-6165625d55c4)
 - **19 avr. 2026** -- [MLX vs CoreML sur Apple Silicon -- guide pratique pour choisir le bon backend](https://blog.ivan.digital/mlx-vs-coreml-on-apple-silicon-a-practical-guide-to-picking-the-right-backend-and-why-you-should-f77ddea7b27a)
 - **20 mars 2026** -- [Nous battons Whisper Large v3 avec un modele de 600M tournant entierement sur votre Mac](https://blog.ivan.digital/we-beat-whisper-large-v3-with-a-600m-model-running-entirely-on-your-mac-20e6ce191174)
 - **26 fev. 2026** -- [Diarisation de locuteurs et detection d'activite vocale sur Apple Silicon -- Swift natif avec MLX](https://blog.ivan.digital/speaker-diarization-and-voice-activity-detection-on-apple-silicon-native-swift-with-mlx-92ea0c9aca0f)
