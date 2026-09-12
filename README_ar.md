@@ -116,6 +116,7 @@
 
 <div dir="rtl">
 
+- **10 سبتمبر 2026** — [NVIDIA Nemotron VoiceChat على Apple Silicon — كلام ثنائي الاتجاه الكامل مع الأدوات](https://blog.ivan.digital/nvidia-nemotron-voicechat-on-apple-silicon-full-duplex-speech-with-tools-6165625d55c4)
 - **19 أبريل 2026** — [MLX مقابل CoreML على Apple Silicon — دليل عملي لاختيار الواجهة الخلفية المناسبة](https://blog.ivan.digital/mlx-vs-coreml-on-apple-silicon-a-practical-guide-to-picking-the-right-backend-and-why-you-should-f77ddea7b27a)
 - **20 مارس 2026** — [تفوقنا على Whisper Large v3 بنموذج 600M يعمل بالكامل على جهاز Mac الخاص بك](https://blog.ivan.digital/we-beat-whisper-large-v3-with-a-600m-model-running-entirely-on-your-mac-20e6ce191174)
 - **26 فبراير 2026** — [تمييز المتحدثين واكتشاف النشاط الصوتي على Apple Silicon — Swift أصلي مع MLX](https://blog.ivan.digital/speaker-diarization-and-voice-activity-detection-on-apple-silicon-native-swift-with-mlx-92ea0c9aca0f)

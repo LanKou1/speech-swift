@@ -102,6 +102,7 @@
 
 ## 动态
 
+- **2026 年 9 月 10 日** — [Apple Silicon 上的 NVIDIA Nemotron VoiceChat — 支持工具调用的全双工语音对话](https://blog.ivan.digital/nvidia-nemotron-voicechat-on-apple-silicon-full-duplex-speech-with-tools-6165625d55c4)
 - **2026 年 4 月 19 日** — [Apple Silicon 上的 MLX 与 CoreML — 如何选择合适的推理后端](https://blog.ivan.digital/mlx-vs-coreml-on-apple-silicon-a-practical-guide-to-picking-the-right-backend-and-why-you-should-f77ddea7b27a)
 - **2026 年 3 月 20 日** — [我们用一个 600M 模型在 Mac 上击败了 Whisper Large v3](https://blog.ivan.digital/we-beat-whisper-large-v3-with-a-600m-model-running-entirely-on-your-mac-20e6ce191174)
 - **2026 年 2 月 26 日** — [Apple Silicon 上的说话人分离与语音活动检测——基于 MLX 的原生 Swift 实现](https://blog.ivan.digital/speaker-diarization-and-voice-activity-detection-on-apple-silicon-native-swift-with-mlx-92ea0c9aca0f)

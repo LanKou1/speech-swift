@@ -102,6 +102,7 @@ Speech Swift 패키지 참조를 공개 소스에서 확인할 수 있는 저장
 
 ## 소식
 
+- **2026년 9월 10일** — [Apple Silicon에서 NVIDIA Nemotron VoiceChat — 도구 호출을 지원하는 전이중 음성 대화](https://blog.ivan.digital/nvidia-nemotron-voicechat-on-apple-silicon-full-duplex-speech-with-tools-6165625d55c4)
 - **2026년 4월 19일** — [Apple Silicon에서의 MLX와 CoreML — 올바른 백엔드 선택을 위한 실용 가이드](https://blog.ivan.digital/mlx-vs-coreml-on-apple-silicon-a-practical-guide-to-picking-the-right-backend-and-why-you-should-f77ddea7b27a)
 - **2026년 3월 20일** — [600M 모델로 Mac에서 Whisper Large v3를 능가하다](https://blog.ivan.digital/we-beat-whisper-large-v3-with-a-600m-model-running-entirely-on-your-mac-20e6ce191174)
 - **2026년 2월 26일** — [Apple Silicon에서의 화자 분리 및 음성 활동 감지 — MLX 기반 네이티브 Swift](https://blog.ivan.digital/speaker-diarization-and-voice-activity-detection-on-apple-silicon-native-swift-with-mlx-92ea0c9aca0f)
