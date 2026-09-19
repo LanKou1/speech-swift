@@ -65,8 +65,33 @@ fi
 OUT_METALLIB="$OUT_DIR/mlx.metallib"
 HASH_FILE="$OUT_DIR/.mlx.metallib.sha"
 
-# Content hash of all metal sources + headers to detect changes
-CURRENT_HASH="$(find "$KERNELS_DIR" -type f \( -name '*.metal' -o -name '*.h' \) ! -name '*_nax.metal' | LC_ALL=C sort | xargs cat | shasum -a 256 | awk '{print $1}')"
+# Match the package's minimum OS even when built with a newer SDK.
+DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
+LANGUAGE_VERSION="${MLX_METAL_LANGUAGE_VERSION:-3.2}"
+METAL_FLAGS=(
+  -x metal
+  "-std=metal${LANGUAGE_VERSION}"
+  "-mmacosx-version-min=${DEPLOYMENT_TARGET}"
+  -g0
+  -Wall -Wextra -fno-fast-math
+  -Wno-c++17-extensions -Wno-c++20-extensions
+)
+
+# A source-only cache can retain an incompatible library after an SDK or
+# target change. Include the complete compilation identity and this script.
+CURRENT_HASH="$(
+  {
+    printf '%s\n' "$CONFIG" "${METAL_FLAGS[@]}"
+    xcrun -sdk macosx --show-sdk-path
+    xcrun -sdk macosx --show-sdk-version
+    xcrun -sdk macosx metal --version
+    cat "${BASH_SOURCE[0]}"
+    while IFS= read -r file; do
+      printf '%s\n' "${file#"$KERNELS_DIR/"}"
+      cat "$file"
+    done < <(find "$KERNELS_DIR" -type f \( -name '*.metal' -o -name '*.h' \) ! -name '*_nax.metal' | LC_ALL=C sort)
+  } | shasum -a 256 | awk '{print $1}'
+)"
 
 if [[ "$FORCE" != "1" && -f "$OUT_METALLIB" && -f "$HASH_FILE" ]]; then
   PREV_HASH="$(cat "$HASH_FILE" 2>/dev/null || true)"
@@ -84,14 +109,7 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   trap cleanup EXIT
 
   AIR_FILES=()
-  METAL_FLAGS=(
-    -x metal
-    -Wall
-    -Wextra
-    -fno-fast-math
-    -Wno-c++17-extensions
-    -Wno-c++20-extensions
-  )
+
 
   echo "Compiling ${#METAL_SRCS[@]} Metal sources..."
   for SRC in "${METAL_SRCS[@]}"; do
@@ -111,7 +129,8 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   done
 
   echo "Linking mlx.metallib -> $OUT_METALLIB"
-  xcrun -sdk macosx metallib "${AIR_FILES[@]}" -o "$OUT_METALLIB"
+  xcrun -sdk macosx metallib "${AIR_FILES[@]}" -o "$TMP/mlx.metallib"
+  mv "$TMP/mlx.metallib" "$OUT_METALLIB"
 
   printf '%s' "$CURRENT_HASH" > "$HASH_FILE"
   echo "OK: wrote $OUT_METALLIB"
