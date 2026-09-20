@@ -374,12 +374,46 @@ Text -> [TextProjector] -> embeddings
 
 ### Conversion
 
+The reproducible six-component exporter is available at
+[`scripts/convert_qwen3_tts_coreml.py`](../../scripts/convert_qwen3_tts_coreml.py).
+See the [conversion guide](../../scripts/qwen3_tts_coreml/COREML.md) for pinned
+Python dependencies, serial export commands, speaker preparation, and numerical
+validation against the upstream checkpoint.
+
+The experimental exporter supports model-derived dimensions and a configurable CodeDecoder
+cache. For 1.7B Base, the talker and speaker embedding have 2048 channels, while
+the code predictor remains 1024-wide and requires its trained input projection.
+A 1024-position stateful CodeDecoder must be re-exported with matching cache and
+mask shapes; changing a generation limit alone is insufficient. CodeDecoder
+defaults to FP32 computation because FP16 failed real-checkpoint validation;
+its state tensors remain FP16.
+
 ```bash
 python scripts/convert_qwen3_tts_coreml.py \
-    --model-id Qwen/Qwen3-TTS-12Hz-0.6B-Base \
-    --output-dir models/Qwen3-TTS-CoreML \
-    --quantize-w8
+    --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --revision fd4b254389122332181a7c3db7f27e918eec64e3 \
+    --tokenizer-revision 7dd38ad4e9bad454aae9cd937d0cd577604fe229 \
+    --max-seq-len 1024 --only CodeDecoder --compile \
+    --output-dir models/Qwen3-TTS-1.7B-CoreML
 ```
+
+Use one component per process as shown in the conversion guide to bound memory.
+The experimental [1.7B model bundle](https://huggingface.co/aufklarer/Qwen3-TTS-1.7B-CoreML)
+is approximately 7.1 GB. All six components pass CPU numerical checks against
+PyTorch, and a separate synthetic-input test fills all 1024 cache positions
+with exact fresh-state reset. Two English speech samples reach EOS and
+transcribe correctly. GPU/Neural Engine placement and iOS are not validated.
+
+The new export uses the included Python reference runner. The Swift runtime
+below still assumes the original 0.6B model, 1024-channel embeddings, and a
+256-position cache; the 1.7B export is not a drop-in replacement.
+
+Cache capacity includes the text/speaker prompt and generated audio positions.
+SpeechDecoder has a separate fixed 125-frame capacity by default: 10 seconds at
+24 kHz and 1920 samples/frame. Increasing CodeDecoder to 1024 does not enlarge
+SpeechDecoder or guarantee a particular compute-device placement. The Python
+runner rejects requests exceeding the exported speech-frame capacity.
+
 
 ### Usage (Swift)
 
