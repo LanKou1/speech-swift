@@ -401,8 +401,9 @@ Use one component per process as shown in the conversion guide to bound memory.
 The experimental [1.7B model bundle](https://huggingface.co/aufklarer/Qwen3-TTS-1.7B-CoreML)
 is approximately 7.1 GB. All six components pass CPU numerical checks against
 PyTorch, and a separate synthetic-input test fills all 1024 cache positions
-with exact fresh-state reset. Two English speech samples reach EOS and
-transcribe correctly. GPU/Neural Engine placement and iOS are not validated.
+with exact fresh-state reset. Twelve English speech samples reach EOS and
+transcribe with 0% WER across 92 words. See the [CPU benchmark report](../benchmarks/qwen3-tts-17b-coreml.md)
+for latency and test scope. GPU/Neural Engine placement and iOS are not validated.
 
 The new export uses the included Python reference runner. The Swift runtime
 below still assumes the original 0.6B model, 1024-channel embeddings, and a
