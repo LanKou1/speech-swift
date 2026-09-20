@@ -87,15 +87,16 @@ def test_cache_boundaries_and_reset():
     torch.testing.assert_close(stateful(embed, torch.tensor([0]), pad, update)[0], fresh(embed, torch.tensor([0]), pad, update)[0])
 
 
+@pytest.mark.parametrize("capacity", [1, 1024])
 @torch.no_grad()
-def test_compiled_stateful_graph_at_1024_positions(tmp_path):
+def test_compiled_stateful_graph_cache_boundaries(tmp_path, capacity):
     import coremltools as ct
     import numpy as np
     talker = make_talker(128)
-    wrapper = C.CodeDecoderWrapper(talker, stateful=True, max_seq_len=1024)
-    embed = torch.randn(1, 128, 1, 1)
-    pad, update = masks(0, 1024)
-    traced = torch.jit.trace(wrapper, (embed, torch.tensor([0]), pad, update), check_trace=False)
+    wrapper = C.CodeDecoderWrapper(talker, stateful=True, max_seq_len=capacity)
+    inputs = C.code_decoder_trace_inputs(128, wrapper.num_layers * wrapper.kv_dim, capacity, True)
+    embed = inputs[0]
+    traced = torch.jit.trace(wrapper, inputs, check_trace=False)
     for module in (wrapper, traced):
         module.key_cache.zero_(); module.value_cache.zero_()
     dim = wrapper.num_layers * wrapper.kv_dim
@@ -103,14 +104,14 @@ def test_compiled_stateful_graph_at_1024_positions(tmp_path):
         compute_units=ct.ComputeUnit.CPU_ONLY,
         inputs=[ct.TensorType("input_embeds",shape=(1,128,1,1),dtype=np.float16),
                 ct.TensorType("cache_length",shape=(1,),dtype=np.int32),
-                ct.TensorType("key_padding_mask",shape=(1,1024),dtype=np.float16),
-                ct.TensorType("kv_cache_update_mask",shape=(1,1024),dtype=np.float16)],
-        states=[ct.StateType(ct.TensorType(shape=(1,dim,1,1024),dtype=np.float16),name=n)
+                ct.TensorType("key_padding_mask",shape=(1,capacity),dtype=np.float16),
+                ct.TensorType("kv_cache_update_mask",shape=(1,capacity),dtype=np.float16)],
+        states=[ct.StateType(ct.TensorType(shape=(1,dim,1,capacity),dtype=np.float16),name=n)
                 for n in ("key_cache","value_cache")],
         outputs=[ct.TensorType("logits",dtype=np.float16),ct.TensorType("hidden_states",dtype=np.float16)])
     state=model.make_state()
-    for pos in (0,1,255,256,1023):
-        pad,update=masks(pos,1024)
+    for pos in (p for p in (0,1,255,256,1023) if p < capacity):
+        pad,update=masks(pos,capacity)
         expected=wrapper(embed,torch.tensor([pos]),pad,update)
         output=model.predict({"input_embeds":embed.numpy().astype(np.float16),
             "cache_length":np.array([pos],np.int32),"key_padding_mask":pad.numpy().astype(np.float16),

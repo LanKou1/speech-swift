@@ -515,6 +515,18 @@ class SpeechDecoderWrapper(nn.Module):
 # Conversion helpers
 # ============================================================================
 
+def code_decoder_trace_inputs(hidden_size, total_kv, capacity, stateful):
+    """Trace at position zero so every positive cache capacity is supported."""
+    padding = torch.full((1, capacity), float('-inf'))
+    padding[:, 0] = 0
+    update = torch.zeros(1, capacity)
+    update[:, 0] = 1
+    inputs = (torch.randn(1, hidden_size, 1, 1), torch.tensor([0]), padding, update)
+    if not stateful:
+        inputs += (torch.zeros(1, total_kv, 1, capacity), torch.zeros(1, total_kv, 1, capacity))
+    return inputs
+
+
 def convert_to_coreml(wrapper, inputs, outputs, precision, quantize_w8):
     import coremltools as ct
     from coremltools.optimize.coreml import OpPalettizerConfig, OptimizationConfig, palettize_weights
@@ -561,7 +573,7 @@ def main():
     parser.add_argument("--max-seq-len", type=int, default=256, help="Talker cache positions, including the prompt")
     parser.add_argument("--reference-audio", help="Optional reference WAV used to extract speaker_embedding.npy")
     parser.add_argument("--no-stateful", action="store_true", help="Disable MLState (use explicit KV cache I/O)")
-    parser.add_argument("--only", type=str, default=None, help="Comma-separated: TextProjector,CodeEmbedder,MultiCodeEmbedder,CodeDecoder,MultiCodeDecoder,SpeechDecoder")
+    parser.add_argument("--only", type=str, default=None, help="Comma-separated: TextProjector,CodeEmbedder,MultiCodeEmbedder,CodeDecoder,MultiCodeDecoder,SpeechDecoder,Embeddings")
     parser.add_argument("--compile", action="store_true",
                         help="Compile all saved .mlpackage files → .mlmodelc for distribution")
     args = parser.parse_args()
@@ -652,16 +664,7 @@ def main():
         use_stateful = not (args.no_stateful if hasattr(args, 'no_stateful') else False)
         w = CodeDecoderWrapper(talker, stateful=use_stateful, max_seq_len=max_seq_len)
         w.eval()
-        if use_stateful:
-            # Stateful: KV cache as buffers, not forward args
-            test = (torch.randn(1, hidden_size, 1, 1), torch.tensor([5]),
-                    torch.zeros(1, max_seq_len), torch.zeros(1, max_seq_len))
-            test[2][0, 6:] = float('-inf'); test[3][0, 5] = 1.0
-        else:
-            test = (torch.randn(1, hidden_size, 1, 1), torch.tensor([5]),
-                    torch.zeros(1, max_seq_len), torch.zeros(1, max_seq_len),
-                    torch.randn(1, total_kv, 1, max_seq_len), torch.randn(1, total_kv, 1, max_seq_len))
-            test[2][0, 6:] = float('-inf'); test[3][0, 5] = 1.0
+        test = code_decoder_trace_inputs(hidden_size, total_kv, max_seq_len, use_stateful)
         traced = torch.jit.trace(w, test, strict=False, check_trace=False)
         if use_stateful:
             for cache in (w.key_cache, w.value_cache, traced.key_cache, traced.value_cache):
