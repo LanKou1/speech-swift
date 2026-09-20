@@ -2,7 +2,7 @@
 import CoreML
 import Foundation
 
-/// CoreML text token → embedding [1, 1024, 1, 1].
+/// CoreML text token → embedding [1, hiddenSize, 1, 1].
 /// Replaces Swift-side text_embedding + FC1→SiLU→FC2 projection.
 final class TextProjectorModel {
     private let model: MLModel
@@ -18,7 +18,7 @@ final class TextProjectorModel {
     }
 }
 
-/// CoreML codec token → embedding [1, 1024, 1, 1].
+/// CoreML codec token → embedding [1, hiddenSize, 1, 1].
 /// Replaces Swift-side codec_embedding table lookup.
 final class CodeEmbedderModel {
     private let model: MLModel
@@ -34,7 +34,7 @@ final class CodeEmbedderModel {
     }
 }
 
-/// CoreML linearized CB1-15 token → embedding [1, 1024, 1, 1].
+/// CoreML linearized CB1-15 token → embedding [1, hiddenSize, 1, 1].
 /// Replaces Swift-side cpCodecEmbeddings table lookup + sum.
 final class MultiCodeEmbedderModel {
     private let model: MLModel
@@ -79,11 +79,7 @@ func addMLMultiArrays(_ a: MLMultiArray, _ b: MLMultiArray) -> MLMultiArray {
 
     // Read each input respecting its data type
     func read(_ arr: MLMultiArray, _ i: Int) -> Float {
-        if arr.dataType == .float32 {
-            return arr.dataPointer.assumingMemoryBound(to: Float.self)[i]
-        } else {
-            return Float(arr.dataPointer.assumingMemoryBound(to: Float16.self)[i])
-        }
+        arr[[0, NSNumber(value: i), 0, 0]].floatValue
     }
 
     for i in 0..<channels {

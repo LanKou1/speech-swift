@@ -6,7 +6,7 @@ import AudioCommon
 public struct Qwen3TTSCoreMLCommand: ParsableCommand {
     public static let configuration = CommandConfiguration(
         commandName: "qwen3-tts-coreml",
-        abstract: "Text-to-speech using Qwen3-TTS (CoreML, Neural Engine)"
+        abstract: "Text-to-speech using Qwen3-TTS (CoreML)"
     )
 
     @Argument(help: "Text to synthesize")
@@ -30,6 +30,12 @@ public struct Qwen3TTSCoreMLCommand: ParsableCommand {
     @Option(name: .long, help: "HuggingFace model ID")
     public var model: String = Qwen3TTSCoreMLModel.defaultModelId
 
+    @Option(name: .long, help: "Prepared Float32 speaker embedding (.npy); must match the model width")
+    public var speakerEmbedding: String?
+
+    @Option(name: .long, help: "Load a local compiled model bundle")
+    public var modelDirectory: String?
+
     public init() {}
 
     public func run() throws {
@@ -37,6 +43,8 @@ public struct Qwen3TTSCoreMLCommand: ParsableCommand {
             print("Loading Qwen3-TTS CoreML models...")
             let ttsModel = try await Qwen3TTSCoreMLModel.fromPretrained(
                 modelId: model,
+                localPath: modelDirectory,
+                speakerEmbeddingURL: speakerEmbedding.map { URL(fileURLWithPath: $0) },
                 progressHandler: { progress, status in
                     let pct = Int(progress * 100)
                     print("\r  \(status) \(pct)%", terminator: "")

@@ -3,12 +3,13 @@ import CoreML
 import Foundation
 import AudioCommon
 
-/// Qwen3-TTS CoreML inference with 6-model ANE-optimized architecture.
+/// Qwen3-TTS CoreML inference with six compiled model components.
 ///
 /// Models: TextProjector, CodeEmbedder, MultiCodeEmbedder, CodeDecoder,
 ///         MultiCodeDecoder, SpeechDecoder
 public final class Qwen3TTSCoreMLModel {
     public static let defaultModelId = "aufklarer/Qwen3-TTS-CoreML"
+    public static let largeModelId = "aufklarer/Qwen3-TTS-1.7B-CoreML"
 
     private var codeDecoder: CodeDecoderInterface?
     private var multiCodeDecoder: MultiCodeDecoderInterface?
@@ -18,22 +19,31 @@ public final class Qwen3TTSCoreMLModel {
     private var multiCodeEmbedder: MultiCodeEmbedderModel?
     private var tokenizer: Qwen3Tokenizer?
 
-    // Pre-computed special embeddings [1, 1024, 1, 1]
+    // Pre-computed special embeddings [1, hiddenSize, 1, 1]
     private var ttsPadEmbed: MLMultiArray?
     private var ttsBosEmbed: MLMultiArray?
     private var ttsEosEmbed: MLMultiArray?
     public var speakerEmbedding: MLMultiArray?
 
-    private let hiddenSize = 1024
+    public private(set) var hiddenSize = 1024
+    public private(set) var maxSequenceLength = 256
+    public private(set) var maximumAudioFrames = 125
+    private var configuration: BundleConfiguration?
     private let codecVocabSize = 3072
     private let codecEos = 2150
 
+    /// Load a compiled bundle. The default model remains 0.6B.
+    /// - Parameters:
+    ///   - computeUnits: Decoder route; nil uses the bundle default (0.6B: ANE, 1.7B: CPU).
+    ///   - speakerEmbeddingURL: Prepared Float32 NPY vector matching the talker width.
+    ///     Required at synthesis time when the bundle has no default speaker.
     public static func fromPretrained(
         modelId: String = defaultModelId,
         localPath: String? = nil,
         cacheDir: URL? = nil,
         offlineMode: Bool = false,
-        computeUnits: MLComputeUnits = .all,
+        computeUnits: MLComputeUnits? = nil,
+        speakerEmbeddingURL: URL? = nil,
         progressHandler: ((Double, String) -> Void)? = nil
     ) async throws -> Qwen3TTSCoreMLModel {
         let resolvedCacheDir: URL
@@ -56,20 +66,16 @@ public final class Qwen3TTSCoreMLModel {
             ) { progress in progressHandler?(progress * 0.7, "Downloading model...") }
         }
 
+        let configuration = try BundleConfiguration.load(from: resolvedCacheDir)
+
         // Embedders on CPU (FP32 precision for accumulation, matching TTSKit).
         let cpuConfig = MLModelConfiguration()
         cpuConfig.computeUnits = .cpuOnly
 
-        // CodeDecoder / MultiCodeDecoder / SpeechDecoder default to ANE.
-        // The bundle was exported with the CPU_AND_NE + FP32 recipe so the
-        // 28-layer transformer's logit precision stays stable on ANE — see
-        // models/qwen3-tts/export/convert_coreml.py. Routing the full
-        // decoder chain here lets the pipeline run with no GPU traffic.
-        //
-        // Per-model overrides (for benchmarking / debugging):
-        //   QWEN3TTS_ROUTE_CD  = ane|gpu|cpu|all   (CodeDecoder)
-        //   QWEN3TTS_ROUTE_MCD = ane|gpu|cpu|all   (MultiCodeDecoder)
-        //   QWEN3TTS_ROUTE_SD  = ane|gpu|cpu|all   (SpeechDecoder)
+        // Preserve the legacy ANE default; the 1.7B FP32 bundle defaults to its
+        // validated CPU route. Explicit computeUnits and environment overrides
+        // allow other routes to be evaluated on the target device.
+        let decoderRoute = computeUnits ?? (configuration.hiddenSize == 2048 ? .cpuOnly : .cpuAndNeuralEngine)
         func route(_ key: String, _ fallback: MLComputeUnits) -> MLModelConfiguration {
             let cfg = MLModelConfiguration()
             switch ProcessInfo.processInfo.environment[key] {
@@ -81,13 +87,17 @@ public final class Qwen3TTSCoreMLModel {
             }
             return cfg
         }
-        let cdConfig = route("QWEN3TTS_ROUTE_CD", .cpuAndNeuralEngine)
-        let mcdConfig = route("QWEN3TTS_ROUTE_MCD", .cpuAndNeuralEngine)
-        let sdConfig = route("QWEN3TTS_ROUTE_SD", .cpuAndNeuralEngine)
+        let cdConfig = route("QWEN3TTS_ROUTE_CD", decoderRoute)
+        let mcdConfig = route("QWEN3TTS_ROUTE_MCD", decoderRoute)
+        let sdConfig = route("QWEN3TTS_ROUTE_SD", decoderRoute)
 
         let defaultConfig = cdConfig
 
         let model = Qwen3TTSCoreMLModel()
+        model.configuration = configuration
+        model.hiddenSize = configuration.hiddenSize
+        model.maxSequenceLength = configuration.maxSequenceLength
+        model.maximumAudioFrames = configuration.speechDecoderFrames
 
         progressHandler?(0.7, "Loading models...")
 
@@ -96,7 +106,29 @@ public final class Qwen3TTSCoreMLModel {
         // simulator vs iPhone) so we never run it here.
         func loadML(_ name: String, _ cfg: MLModelConfiguration = defaultConfig) throws -> MLModel {
             let compiledURL = resolvedCacheDir.appendingPathComponent("\(name).mlmodelc", isDirectory: true)
-            return try MLModel(contentsOf: compiledURL, configuration: cfg)
+            let loaded = try MLModel(contentsOf: compiledURL, configuration: cfg)
+            func require(_ feature: String, _ shape: [Int]) throws {
+                let actual = loaded.modelDescription.inputDescriptionsByName[feature]?.multiArrayConstraint?.shape.map(\.intValue)
+                guard actual == shape else {
+                    throw BundleError.invalidConfiguration("\(name).\(feature): expected \(shape), got \(actual ?? [])")
+                }
+            }
+            if name == "CodeDecoder" || name == "MultiCodeDecoder" {
+                try require("input_embeds", [1, configuration.hiddenSize, 1, 1])
+                try require("key_padding_mask", [1, name == "CodeDecoder" ? configuration.maxSequenceLength : 16])
+            }
+            if name == "MultiCodeDecoder", loaded.modelDescription.stateDescriptionsByName.isEmpty {
+                try require("key_cache", [1, configuration.predictorKVDimension, 1, 16])
+                try require("value_cache", [1, configuration.predictorKVDimension, 1, 16])
+            }
+            if name == "SpeechDecoder" { try require("audio_codes", [1, 16, configuration.speechDecoderFrames]) }
+            if ["TextProjector", "CodeEmbedder", "MultiCodeEmbedder"].contains(name) {
+                let shape = loaded.modelDescription.outputDescriptionsByName["input_embeds"]?.multiArrayConstraint?.shape.map(\.intValue)
+                guard shape == [configuration.hiddenSize, 1, 1] || shape == [1, configuration.hiddenSize, 1, 1] else {
+                    throw BundleError.invalidConfiguration("\(name) embedding width disagrees with config.json")
+                }
+            }
+            return loaded
         }
 
         model.textProjector = TextProjectorModel(model: try loadML("TextProjector", cpuConfig))
@@ -115,6 +147,9 @@ public final class Qwen3TTSCoreMLModel {
             .filter { $0.hasPrefix("CodeDecoder_chunk") && $0.hasSuffix(".mlmodelc") }
             .sorted()
         if !cdChunkFiles.isEmpty {
+            guard configuration.hiddenSize == 1024, configuration.maxSequenceLength == 256 else {
+                throw BundleError.invalidConfiguration("Chunked CodeDecoder requires the legacy 0.6B/256 layout")
+            }
             let cdChunks: [MLModel] = try cdChunkFiles.map { name in
                 let url = resolvedCacheDir.appendingPathComponent(name, isDirectory: true)
                 return try MLModel(contentsOf: url, configuration: cdConfig)
@@ -124,7 +159,7 @@ public final class Qwen3TTSCoreMLModel {
             let cdHead = try MLModel(contentsOf: cdHeadURL, configuration: cdConfig)
             model.codeDecoder = TalkerGeneratorChunked(chunks: cdChunks, head: cdHead)
         } else {
-            model.codeDecoder = TalkerGenerator(model: try loadML("CodeDecoder", cdConfig))
+            model.codeDecoder = TalkerGenerator(model: try loadML("CodeDecoder", cdConfig), maxSeqLen: model.maxSequenceLength, hiddenSize: model.hiddenSize)
         }
 
         // MCD: same detection pattern.
@@ -132,6 +167,9 @@ public final class Qwen3TTSCoreMLModel {
             .filter { $0.hasPrefix("MultiCodeDecoder_chunk") && $0.hasSuffix(".mlmodelc") }
             .sorted()
         if !chunkFiles.isEmpty {
+            guard configuration.hiddenSize == 1024 else {
+                throw BundleError.invalidConfiguration("1.7B requires the monolithic predictor with its input projection")
+            }
             let chunks: [MLModel] = try chunkFiles.map { name in
                 let url = resolvedCacheDir.appendingPathComponent(name, isDirectory: true)
                 return try MLModel(contentsOf: url, configuration: mcdConfig)
@@ -141,36 +179,27 @@ public final class Qwen3TTSCoreMLModel {
             let headModel = try MLModel(contentsOf: headURL, configuration: mcdConfig)
             model.multiCodeDecoder = MultiCodeDecoderChunked(chunks: chunks, head: headModel)
         } else {
-            model.multiCodeDecoder = MultiCodeDecoderCoreML(model: try loadML("MultiCodeDecoder", mcdConfig))
+            model.multiCodeDecoder = MultiCodeDecoderCoreML(model: try loadML("MultiCodeDecoder", mcdConfig), inputWidth: model.hiddenSize, totalKVDim: configuration.predictorKVDimension)
         }
 
-        model.speechDecoder = SpeechDecoderCoreML(model: try loadML("SpeechDecoder", sdConfig))
+        model.speechDecoder = SpeechDecoderCoreML(model: try loadML("SpeechDecoder", sdConfig), batchFrames: model.maximumAudioFrames)
 
         progressHandler?(0.9, "Loading embeddings...")
 
-        // Load special embeddings from .npy or compute from TextProjector
-        func loadNpy(_ name: String) -> MLMultiArray? {
-            let url = resolvedCacheDir.appendingPathComponent("\(name).npy")
-            guard let data = try? Data(contentsOf: url), data.count > 10 else { return nil }
-            var headerEnd = 10
-            for i in 8..<min(256, data.count) { if data[i] == 0x0A { headerEnd = i + 1; break } }
-            let floatData = data.subdata(in: headerEnd..<data.count)
-            let count = floatData.count / 4
-            // Keep FP32 to match Python pipeline (cast to FP16 happens at model input)
-            let result = try! MLMultiArray(shape: [1, NSNumber(value: count), 1, 1], dataType: .float32)
+        func loadNpy(_ url: URL) throws -> MLMultiArray {
+            let values = try EmbeddingFile.read(Data(contentsOf: url), channels: model.hiddenSize)
+            let result = try MLMultiArray(shape: [1, NSNumber(value: model.hiddenSize), 1, 1], dataType: .float32)
             let dst = result.dataPointer.assumingMemoryBound(to: Float.self)
-            floatData.withUnsafeBytes { raw in
-                let src = raw.bindMemory(to: Float.self)
-                for i in 0..<count { dst[i] = src[i] }
-            }
+            for (i, value) in values.enumerated() { dst[i] = value }
             return result
         }
-
-        // Load from npy (PyTorch FP32 precision, matches Python inference pipeline)
-        model.ttsPadEmbed = loadNpy("tts_pad_embed")
-        model.ttsBosEmbed = loadNpy("tts_bos_embed")
-        model.ttsEosEmbed = loadNpy("tts_eos_embed")
-        model.speakerEmbedding = loadNpy("speaker_embedding")
+        model.ttsPadEmbed = try loadNpy(resolvedCacheDir.appendingPathComponent("tts_pad_embed.npy"))
+        model.ttsBosEmbed = try loadNpy(resolvedCacheDir.appendingPathComponent("tts_bos_embed.npy"))
+        model.ttsEosEmbed = try loadNpy(resolvedCacheDir.appendingPathComponent("tts_eos_embed.npy"))
+        let speakerURL = speakerEmbeddingURL ?? resolvedCacheDir.appendingPathComponent("speaker_embedding.npy")
+        if speakerEmbeddingURL != nil || fm.fileExists(atPath: speakerURL.path) {
+            model.speakerEmbedding = try loadNpy(speakerURL)
+        }
 
         // Load tokenizer
         let tokenizer = Qwen3Tokenizer()
@@ -196,9 +225,25 @@ public final class Qwen3TTSCoreMLModel {
     ) throws -> [Float] {
         guard let codeDecoder, let multiCodeDecoder, let speechDecoder,
               let textProjector, let codeEmbedder, let multiCodeEmbedder,
-              let tokenizer, let ttsPadEmbed, let ttsBosEmbed, let ttsEosEmbed else {
+              let tokenizer, let ttsPadEmbed, let ttsBosEmbed, let ttsEosEmbed, let configuration else {
             throw TTSCoreMLError.modelNotLoaded
         }
+
+        guard temperature.isFinite, temperature >= 0, topK >= 0,
+              repetitionPenalty.isFinite, repetitionPenalty > 0 else {
+            throw BundleError.invalidInput("Sampling parameters must be finite and nonnegative; repetitionPenalty must be positive")
+        }
+        if configuration.requiresSpeakerEmbedding && speakerEmbedding == nil {
+            throw BundleError.invalidInput("Supply a \(hiddenSize)-channel speaker embedding using speakerEmbeddingURL or speakerEmbedding")
+        }
+        if let speakerEmbedding {
+            guard speakerEmbedding.shape.map(\.intValue) == [1, hiddenSize, 1, 1],
+                  (0..<hiddenSize).allSatisfy({ speakerEmbedding[[0, NSNumber(value: $0), 0, 0]].floatValue.isFinite }) else {
+                throw BundleError.invalidInput("Expected a finite [1, \(hiddenSize), 1, 1] speaker embedding")
+            }
+        }
+        // Check the independent vocoder limit before any model prediction.
+        _ = try configuration.generationLimit(requested: maxTokens, promptCount: 1)
 
         // Per-stage timing — printed at the end when QWEN3TTS_BENCH=1
         let benchOn = ProcessInfo.processInfo.environment["QWEN3TTS_BENCH"] == "1"
@@ -212,20 +257,17 @@ public final class Qwen3TTSCoreMLModel {
             text: text, language: language, tokenizer: tokenizer,
             textProjector: textProjector, codeEmbedder: codeEmbedder,
             ttsPadEmbed: ttsPadEmbed, ttsBosEmbed: ttsBosEmbed,
-            ttsEosEmbed: ttsEosEmbed, speakerEmbedding: speakerEmbedding)
+            ttsEosEmbed: ttsEosEmbed, speakerEmbedding: speakerEmbedding, hiddenSize: hiddenSize)
         tPromptEnd = CFAbsoluteTimeGetCurrent()
 
-        // Cap decode tokens: min(requested, 8× prefill, remaining KV cache slots)
-        let maxStepsByPrefill = 8 * prefillEmbeds.count
-        let cacheSlots = 256 - prefillEmbeds.count
-        let effectiveMaxTokens = min(maxTokens, min(maxStepsByPrefill, cacheSlots))
+        let effectiveMaxTokens = try configuration.generationLimit(requested: maxTokens, promptCount: prefillEmbeds.count)
 
         // Reset CodeDecoder KV cache
         codeDecoder.resetCache()
 
         // Prefill: run all positions through CodeDecoder
         var lastLogits = [Float]()
-        var lastHidden = try MLMultiArray(shape: [1, 1024, 1, 1], dataType: .float16)
+        var lastHidden = try MLMultiArray(shape: [1, NSNumber(value: hiddenSize), 1, 1], dataType: .float16)
         for embed in prefillEmbeds {
             let t = CFAbsoluteTimeGetCurrent()
             (lastLogits, _) = try codeDecoder.forward(embedArray: embed)

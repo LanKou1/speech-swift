@@ -92,9 +92,14 @@ For longer audio, re-export SpeechDecoder and Embeddings with matching
 `--speech-frames`, then validate the resulting graph and waveform. A
 1024-position CodeDecoder does not automatically enlarge SpeechDecoder.
 
-The existing speech-swift CoreML runtime assumes 0.6B widths and a 256-position
-cache. Use the included Python runner for this export until the Swift runtime
-supports these dimensions. The existing 0.6B model bundle remains separate.
+The speech-swift CoreML runtime also reads these bundle dimensions and supports
+1.7B/1024 through `Qwen3TTSCoreMLModel.largeModelId` or the dedicated
+`speech qwen3-tts-coreml --model aufklarer/Qwen3-TTS-1.7B-CoreML` command.
+Supply the prepared embedding with `speakerEmbeddingURL` in Swift or
+`--speaker-embedding speaker_embedding.npy` in the CLI. The 1.7B bundle defaults
+to CPU; the separate 0.6B bundle remains the default model. See the
+[Swift inference guide](https://github.com/soniqo/speech-swift/blob/main/docs/inference/qwen3-tts-inference.md)
+for API details and frame limits.
 
 ## Validation
 
