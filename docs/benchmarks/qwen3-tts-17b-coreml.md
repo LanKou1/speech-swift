@@ -67,8 +67,8 @@ attention, sampling, and frame-limit rejection. All six real-checkpoint
 component comparisons pass; a separate synthetic test fills all 1024 cache
 positions and verifies finite values and exact reset.
 
-The source PR changes no Swift runtime, package definition, or existing model
-artifacts. The current Swift CoreML runtime still targets 0.6B/256. GPU/ANE,
+The original export PR changed no Swift runtime, package definition, or existing
+model artifacts. At the time of this Python benchmark, Swift targeted 0.6B/256. GPU/ANE,
 iOS, and long continuous synthesis are not validated by this CPU report.
 
 ## Per-sentence results

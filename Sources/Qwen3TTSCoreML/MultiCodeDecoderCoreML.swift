@@ -10,18 +10,21 @@ import Foundation
 final class MultiCodeDecoderCoreML {
     private let model: MLModel
     private let maxSeqLen = 16
-    private let totalKVDim = 5120  // 5 layers * 8 KV heads * 128 head_dim
+    private let totalKVDim: Int
+    private let inputWidth: Int
     private let numGroups = 15
     private let isStateful: Bool
 
-    init(model: MLModel) {
+    init(model: MLModel, inputWidth: Int = 1024, totalKVDim: Int = 5120) {
+        self.inputWidth = inputWidth
+        self.totalKVDim = totalKVDim
         self.model = model
         self.isStateful = !model.modelDescription.stateDescriptionsByName.isEmpty
     }
 
     /// Predict 15 residual codebook tokens autoregressively.
     /// - Parameters:
-    ///   - hiddenState: [1, 1024, 1, 1] from CodeDecoder
+    ///   - hiddenState: [1, talkerWidth, 1, 1] from CodeDecoder; projection is inside the model
     ///   - cb0Token: First codebook token
     ///   - codeEmbedder: For embedding CB0
     ///   - multiCodeEmbedder: For embedding CB1-14 tokens
@@ -46,12 +49,12 @@ final class MultiCodeDecoderCoreML {
 
         // Position 0: feed hidden_states from CodeDecoder
         var (_, kc0, vc0) = try step(
-            embed: ensureNCHW(hiddenState, channels: 1024),
+            embed: ensureNCHW(hiddenState, channels: inputWidth),
             position: 0, keyCache: keyCache, valueCache: valueCache, state: mlState)
         if !isStateful { keyCache = kc0; valueCache = vc0 }
 
         // Position 1: feed CodeEmbedder(CB0) → read lm_head[0] → CB1
-        let cb0Embed = ensureNCHW(try codeEmbedder.embed(Int(cb0Token)), channels: 1024)
+        let cb0Embed = ensureNCHW(try codeEmbedder.embed(Int(cb0Token)), channels: inputWidth)
         var (logits, kc1, vc1) = try step(embed: cb0Embed, position: 1,
                                           keyCache: keyCache, valueCache: valueCache, state: mlState)
         if !isStateful { keyCache = kc1; valueCache = vc1 }
@@ -65,7 +68,7 @@ final class MultiCodeDecoderCoreML {
         for cbStep in 1..<numGroups {
             let embed = ensureNCHW(
                 try multiCodeEmbedder.embed(codebookIdx: cbStep - 1, tokenId: Int(prevToken)),
-                channels: 1024)
+                channels: inputWidth)
             let pos = cbStep + 1
             let (lg, kc, vc) = try step(embed: embed, position: pos,
                                         keyCache: keyCache, valueCache: valueCache, state: mlState)

@@ -40,7 +40,8 @@ struct PromptBuilder {
         ttsPadEmbed: MLMultiArray,
         ttsBosEmbed: MLMultiArray,
         ttsEosEmbed: MLMultiArray,
-        speakerEmbedding: MLMultiArray?
+        speakerEmbedding: MLMultiArray?,
+        hiddenSize: Int = 1024
     ) throws -> [MLMultiArray] {
         let textTokens = prepareTextTokens(text: text, tokenizer: tokenizer)
         let roleIds = Array(textTokens[0..<3])
@@ -51,12 +52,12 @@ struct PromptBuilder {
 
         // [0:3] Role: TextProjector only
         for tid in roleIds {
-            prefill.append(ensureNCHW(try textProjector.embed(tid), channels: 1024))
+            prefill.append(ensureNCHW(try textProjector.embed(tid), channels: hiddenSize))
         }
 
         // [3:7] Control: tts_pad + CodeEmbedder(think tokens)
         for ctok in [2154, 2156, langId, 2157] {
-            let ce = ensureNCHW(try codeEmbedder.embed(ctok), channels: 1024)
+            let ce = ensureNCHW(try codeEmbedder.embed(ctok), channels: hiddenSize)
             prefill.append(addMLMultiArrays(ttsPadEmbed, ce))
         }
 
@@ -66,12 +67,12 @@ struct PromptBuilder {
         }
 
         // Control: tts_bos + CodeEmbedder(codec_pad)
-        let codecPadEmbed = ensureNCHW(try codeEmbedder.embed(2148), channels: 1024)
+        let codecPadEmbed = ensureNCHW(try codeEmbedder.embed(2148), channels: hiddenSize)
         prefill.append(addMLMultiArrays(ttsBosEmbed, codecPadEmbed))
 
         // Text: TextProjector(token) + CodeEmbedder(codec_pad)
         for tid in textIds {
-            let tp = ensureNCHW(try textProjector.embed(tid), channels: 1024)
+            let tp = ensureNCHW(try textProjector.embed(tid), channels: hiddenSize)
             prefill.append(addMLMultiArrays(tp, codecPadEmbed))
         }
 
@@ -79,7 +80,7 @@ struct PromptBuilder {
         prefill.append(addMLMultiArrays(ttsEosEmbed, codecPadEmbed))
 
         // Final: tts_pad + CodeEmbedder(codec_bos)
-        let codecBosEmbed = ensureNCHW(try codeEmbedder.embed(2149), channels: 1024)
+        let codecBosEmbed = ensureNCHW(try codeEmbedder.embed(2149), channels: hiddenSize)
         prefill.append(addMLMultiArrays(ttsPadEmbed, codecBosEmbed))
 
         return prefill
