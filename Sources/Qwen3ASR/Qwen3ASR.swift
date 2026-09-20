@@ -234,7 +234,8 @@ public class Qwen3ASRModel {
                     language: resolvedOptions.language,
                     maxTokens: resolvedOptions.maxTokens,
                     context: resolvedOptions.context,
-                    decodingOptions: resolvedOptions
+                    decodingOptions: resolvedOptions,
+                    checkCancellation: {}
                 )
                 continue
             }
@@ -270,14 +271,53 @@ public class Qwen3ASRModel {
         sampleRate: Int = 16000,
         options: Qwen3DecodingOptions
     ) -> String {
-        guard !Task.isCancelled else { return "" }
+        transcribe(
+            audio: audio, sampleRate: sampleRate, options: options,
+            checkCancellation: {})
+    }
+
+    /// Cancellation-aware transcription for async callers.
+    ///
+    /// Decodes exactly like `transcribe(audio:sampleRate:options:)` but
+    /// observes Swift task cancellation at cooperative checkpoints: before
+    /// feature extraction, before the audio encoder, before decoder prefill,
+    /// and before every decoder step on both the greedy and the
+    /// repetition-aware paths. Once cancellation is observed, this throws
+    /// `CancellationError` instead of returning a partial transcript. MLX
+    /// work already in flight completes first, so cancellation latency is
+    /// bounded by one encoder/prefill evaluation or one token step.
+    ///
+    /// The synchronous `transcribe` overloads keep their non-throwing
+    /// contract and are not task-cancellation entry points. Use this method
+    /// from request-scoped tasks (HTTP handlers, WebSocket sessions, UI
+    /// tasks) where an abandoned request should release the GPU promptly.
+    public func transcribeCheckingCancellation(
+        audio: [Float],
+        sampleRate: Int = 16000,
+        options: Qwen3DecodingOptions = Qwen3DecodingOptions()
+    ) throws -> String {
+        try transcribe(
+            audio: audio, sampleRate: sampleRate, options: options,
+            checkCancellation: { try Task.checkCancellation() })
+    }
+
+    /// Shared implementation behind the synchronous and the
+    /// cancellation-aware entry points. `checkCancellation` is invoked at
+    /// each cooperative checkpoint; the synchronous API passes a no-op.
+    private func transcribe(
+        audio: [Float],
+        sampleRate: Int,
+        options: Qwen3DecodingOptions,
+        checkCancellation: () throws -> Void
+    ) rethrows -> String {
+        try checkCancellation()
         let durationSeconds = sampleRate > 0
             ? Double(audio.count) / Double(sampleRate)
             : 0.0
         let effective = options.adaptedFor(audioDurationSeconds: durationSeconds)
 
         let melFeatures = featureExtractor.process(audio, sampleRate: sampleRate)
-        guard !Task.isCancelled else { return "" }
+        try checkCancellation()
         let batchedFeatures = melFeatures.expandedDimensions(axis: 0)
         var audioEmbeds = audioEncoder(batchedFeatures)
         audioEmbeds = audioEmbeds.expandedDimensions(axis: 0)
@@ -285,13 +325,14 @@ public class Qwen3ASRModel {
             let shape = audioEmbeds.shape
             return "[Audio encoded: \(shape)] - Text decoder not loaded"
         }
-        return generateText(
+        return try generateText(
             audioEmbeds: audioEmbeds,
             textDecoder: textDecoder,
             language: effective.language,
             maxTokens: effective.maxTokens,
             context: effective.context,
-            decodingOptions: effective
+            decodingOptions: effective,
+            checkCancellation: checkCancellation
         )
     }
 
@@ -309,7 +350,6 @@ public class Qwen3ASRModel {
         maxTokens: Int = 448,
         context: String? = nil
     ) -> String {
-        guard !Task.isCancelled else { return "" }
         let durationSeconds = sampleRate > 0
             ? Double(audio.count) / Double(sampleRate)
             : 0.0
@@ -321,7 +361,6 @@ public class Qwen3ASRModel {
         let melFeatures = featureExtractor.process(audio, sampleRate: sampleRate)
 
         // Add batch dimension: [mel, time] -> [1, mel, time]
-        guard !Task.isCancelled else { return "" }
         let batchedFeatures = melFeatures.expandedDimensions(axis: 0)
 
         // Encode audio - returns [time, features] without batch dim (matching Python)
@@ -349,7 +388,8 @@ public class Qwen3ASRModel {
                 language: effective.language,
                 maxTokens: effective.maxTokens,
                 context: effective.context,
-                decodingOptions: effective
+                decodingOptions: effective,
+                checkCancellation: {}
             )
         }
         return generateText(
@@ -357,7 +397,8 @@ public class Qwen3ASRModel {
             textDecoder: textDecoder,
             language: effective.language,
             maxTokens: effective.maxTokens,
-            context: effective.context
+            context: effective.context,
+            checkCancellation: {}
         )
     }
 
@@ -368,15 +409,19 @@ public class Qwen3ASRModel {
     /// optional temperature sampling before each token selection. With the
     /// default `Qwen3DecodingOptions()` (repetition=1.0, no-repeat=0,
     /// temperature=0) behaviour is bit-identical to plain greedy.
+    ///
+    /// `checkCancellation` is invoked before decoder prefill and forwarded
+    /// to the decoder loop, which invokes it before each token's work is
+    /// submitted. Synchronous callers pass a no-op closure.
     func generateText(
         audioEmbeds: MLXArray,
         textDecoder: QuantizedTextModel,
         language: String?,
         maxTokens: Int,
         context: String? = nil,
-        decodingOptions: Qwen3DecodingOptions = Qwen3DecodingOptions()
-    ) -> String {
-        guard !Task.isCancelled else { return "" }
+        decodingOptions: Qwen3DecodingOptions = Qwen3DecodingOptions(),
+        checkCancellation: () throws -> Void
+    ) rethrows -> String {
         let T = Qwen3ASRTokens.self
         let numAudioTokens = audioEmbeds.dim(1)
         var inputIds: [Int32] = []
@@ -430,7 +475,7 @@ public class Qwen3ASRModel {
         var cache: [(MLXArray, MLXArray)]? = nil
 
         // First pass: process the full input embeddings
-        guard !Task.isCancelled else { return "" }
+        try checkCancellation()
         let (hiddenStates, newCache) = textDecoder(inputsEmbeds: inputEmbeds, cache: cache)
         cache = newCache
 
@@ -447,19 +492,21 @@ public class Qwen3ASRModel {
         // manipulation, which would defeat the overlap.
         let generatedTokens: [Int32]
         if Self.isGreedyFastPath(decodingOptions) {
-            generatedTokens = Self.generateGreedyAsyncEval(
-                textDecoder: textDecoder,
-                initialLogits: logits,
-                cache: cache!,
-                maxTokens: maxTokens
-            )
-        } else {
-            generatedTokens = Self.generateSlow(
+            generatedTokens = try Self.generateGreedyAsyncEval(
                 textDecoder: textDecoder,
                 initialLogits: logits,
                 cache: cache!,
                 maxTokens: maxTokens,
-                options: decodingOptions
+                checkCancellation: checkCancellation
+            )
+        } else {
+            generatedTokens = try Self.generateSlow(
+                textDecoder: textDecoder,
+                initialLogits: logits,
+                cache: cache!,
+                maxTokens: maxTokens,
+                options: decodingOptions,
+                checkCancellation: checkCancellation
             )
         }
 
@@ -546,14 +593,22 @@ public class Qwen3ASRModel {
     /// Greedy correctness invariant: argMax is deterministic, so this
     /// produces the exact same token sequence as the legacy loop on
     /// matching inputs.
+    ///
+    /// Cooperative cancellation: `checkCancellation` runs exactly once
+    /// before each token's decoder work is submitted — here for token 0
+    /// (the first `asyncEval` also forces the prefill), then inside the
+    /// loop before every speculative N+1 graph. A throw abandons the
+    /// in-flight step; nothing further is queued on the GPU.
     static func generateGreedyAsyncEval(
         textDecoder: QuantizedTextModel,
         initialLogits: MLXArray,
         cache initialCache: [(MLXArray, MLXArray)],
-        maxTokens: Int
-    ) -> [Int32] {
+        maxTokens: Int,
+        checkCancellation: () throws -> Void
+    ) rethrows -> [Int32] {
         var generatedTokens: [Int32] = []
-        guard maxTokens > 0, !Task.isCancelled else { return generatedTokens }
+        guard maxTokens > 0 else { return generatedTokens }
+        try checkCancellation()
 
         // Stage 0: argmax of the prefill's last logits. Stays lazy until
         // the first `.item()` below.
@@ -574,7 +629,6 @@ public class Qwen3ASRModel {
         let eosToken = Int32(Qwen3ASRTokens.eosTokenId)
 
         for step in 0..<maxTokens {
-            if Task.isCancelled { break }
             // Stage N+1's graph BEFORE syncing N. embedTokens expects a
             // [batch, seq] int32 tensor; nextTokenArr is 0-D so we expand
             // twice to [1, 1].
@@ -585,6 +639,7 @@ public class Qwen3ASRModel {
             var nextTokenArrN1: MLXArray? = nil
             var cacheN1: [(MLXArray, MLXArray)]? = nil
             if step + 1 < maxTokens {
+                try checkCancellation()
                 let nextEmbed = textDecoder.embedTokens(
                     nextTokenArr.expandedDimensions(axis: 0).expandedDimensions(axis: 0)
                 )
@@ -947,12 +1002,18 @@ public class Qwen3ASRModel {
         initialLogits: MLXArray,
         cache initialCache: [(MLXArray, MLXArray)],
         maxTokens: Int,
-        options: Qwen3DecodingOptions
-    ) -> [Int32] {
+        options: Qwen3DecodingOptions,
+        checkCancellation: () throws -> Void
+    ) rethrows -> [Int32] {
         var generatedTokens: [Int32] = []
-        guard maxTokens > 0, !Task.isCancelled else { return generatedTokens }
+        guard maxTokens > 0 else { return generatedTokens }
         var cache: [(MLXArray, MLXArray)]? = initialCache
 
+        // Cooperative cancellation: one checkpoint before each token's
+        // decoder work — here for token 0 (this pick forces the prefill),
+        // then per loop iteration after the EOS exit so natural termination
+        // never runs an extra checkpoint.
+        try checkCancellation()
         var nextToken = Self.pickNextToken(
             logits: initialLogits,
             generatedSoFar: generatedTokens,
@@ -961,8 +1022,8 @@ public class Qwen3ASRModel {
         generatedTokens.append(nextToken)
 
         for _ in 1..<maxTokens {
-            if Task.isCancelled { break }
             if nextToken == Int32(Qwen3ASRTokens.eosTokenId) { break }
+            try checkCancellation()
 
             let tokenEmbeds = textDecoder.embedTokens(
                 MLXArray([nextToken]).expandedDimensions(axis: 0)

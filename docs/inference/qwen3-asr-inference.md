@@ -205,13 +205,17 @@ Qwen3-ASR operates in batch mode only. The entire audio input is processed in a 
 
 For long-form audio (> 15 s) and real-time transcription use cases, use [`StreamingASR.transcribeStream(...)`](https://github.com/soniqo/speech-swift/blob/main/Sources/Qwen3ASR/StreamingASR.swift) — it VAD-segments the input at silence boundaries with a `maxSegmentDuration` force-split safety net (default 10 s), so each segment hits the greedy fast path instead of the slow-path escalation that batch `transcribe(...)` engages on inputs over `longInputThresholdSeconds` (default 15 s). Streaming also avoids the per-segment encoder peak that long batch inputs incur on memory-constrained devices.
 
+## Cooperative Cancellation
+
+`transcribeCheckingCancellation(audio:sampleRate:options:)` is the task-cancellation entry point for the MLX pipeline. It decodes exactly like `transcribe(audio:sampleRate:options:)` but checks Swift task cancellation before feature extraction, before the audio encoder, before decoder prefill, and before every decoder step on both the greedy and the repetition-aware paths. Once cancellation is observed at a checkpoint it throws `CancellationError` instead of returning a partial transcript.
+
+Cancellation latency is bounded by the MLX work already in flight — one encoder/prefill evaluation or one token step; Metal kernels cannot be preempted. The synchronous `transcribe(...)` overloads and `transcribeBatch(...)` retain their non-throwing behavior and are not task-cancellation entry points: a caller that transcribes inside an already-cancelled task still receives the full transcript.
+
+`speech-server` routes Qwen3-ASR requests through the cancellation-aware entry point, so cancelling the task running Qwen3-ASR transcription stops decoding at the next checkpoint instead of continuing to EOS. Disconnect handling must propagate cancellation to that task.
+
 ## Language Detection
 
 The model automatically detects the spoken language from the audio content. No language hint or locale parameter is required. The text decoder emits a language token at the start of generation, followed by the transcribed text. Supported languages include English, Chinese, Japanese, Korean, and many European languages.
-
-## Cancellation
-
-MLX transcription checks Swift task cancellation before encoding, prefill, and between decoder steps. An in-flight GPU operation finishes before cancellation takes effect. The synchronous API may return an empty or partial transcript on cancellation; async callers should call `Task.checkCancellation()` after transcription before accepting the result.
 
 ## Model Architecture Reference
 
