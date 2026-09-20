@@ -123,6 +123,19 @@ Three-tier pipeline, all Apache-2.0 licensed (no GPL dependencies):
 2. **Suffix stemming** — Morphological decomposition for known suffixes
 3. **BART G2P** — Neural grapheme-to-phoneme fallback using a separate CoreML encoder-decoder model for OOV words
 
+### Custom pronunciations
+
+Proper nouns outside the shipped dictionaries reach the BART G2P fallback, which guesses from *English* spelling rules and mangles non-Anglo names. `addPronunciations` injects `word -> IPA` entries ahead of tier 1:
+
+```swift
+let tts = try await KokoroTTSModel.fromPretrained()
+tts.addPronunciations(["tatiana": "tɑtiˈɑnə"])
+```
+
+Keys are matched lowercased and must be single words — text is split on whitespace and punctuation before resolution, so a key containing a space, hyphen, or apostrophe is never looked up. IPA must use symbols from the model vocabulary; anything else is silently dropped at tokenization. Call `addPronunciations` after the dictionaries are loaded — `loadDictionaries` replaces the gold dictionary wholesale.
+
+Entries apply to the English path only: the `language` argument selects a dedicated phonemizer for Chinese, Japanese, Italian, French, Spanish, Portuguese, and Hindi, and none of those consult the gold dictionary. The lookup is unlocked, so register entries before synthesis starts running concurrently on the same model.
+
 ## Voice Embeddings
 
 Each voice is a 256-dimensional Float32 vector stored in a per-voice JSON file. The embedding captures speaker identity and style characteristics. The first 128 dimensions are used by the decoder, the second 128 by the prosody model.

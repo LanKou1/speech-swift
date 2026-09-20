@@ -129,4 +129,30 @@ final class E2EKokoroTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(matchedPhrases.count, 1,
             "At least 1 of \(expectedPhrases) should appear in: \"\(transcription)\"")
     }
+
+    // MARK: - Custom Pronunciations
+
+    /// The neural `bartG2P` fallback guesses from *English* spelling rules, so
+    /// names outside the shipped dictionaries come out wrong. Proves an injected
+    /// entry is resolved instead of that guess — the unit tests in
+    /// `KokoroPronunciationTests` can only pin the resolution order, because
+    /// `bartG2P` needs the downloaded CoreML G2P models.
+    func testCustomPronunciationBeatsNeuralG2P() async throws {
+        let m = try await model()
+        let target = "tɑtiˈɑnə"   // "tah-tee-AH-nuh"
+
+        let guessed = m.phonemizer.textToPhonemes("Tatiana")
+        print("bartG2P guess:            \"\(guessed)\"")
+        XCTAssertNotEqual(guessed, "tatiana",
+            "Expected a phonemic guess from bartG2P, not the raw-letter last resort")
+        XCTAssertNotEqual(guessed, target,
+            "The name must not already resolve correctly, or the test proves nothing")
+
+        m.addPronunciations(["tatiana": target])
+
+        let injected = m.phonemizer.textToPhonemes("Tatiana")
+        print("after addPronunciations:  \"\(injected)\"")
+        XCTAssertEqual(injected, target,
+            "Injected entry must be resolved ahead of the neural G2P fallback")
+    }
 }

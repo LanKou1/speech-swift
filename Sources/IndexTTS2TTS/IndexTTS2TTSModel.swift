@@ -236,8 +236,9 @@ public final class IndexTTS2TTSModel: SpeechGenerationModel, ModelMemoryManageab
                 operation: "IndexTTS2 synthesis",
                 reason: "Tokenizer could not be initialized from bpe.model.")
         }
-        return try runtime().synthesize(
-            textTokens: try tokenizer.encode(text),
+        return try runtime().synthesizeSegments(
+            tokens: try tokenizer.tokenize(text),
+            sampleRate: sampleRate,
             conditioning: conditioning,
             semanticOptions: semanticOptions,
             synthesisOptions: synthesisOptions)
@@ -319,7 +320,7 @@ public final class IndexTTS2TTSModel: SpeechGenerationModel, ModelMemoryManageab
                 operation: "IndexTTS2 synthesis",
                 reason: "Tokenizer could not be initialized from bpe.model.")
         }
-        let textTokens = try tokenizer.encode(text)
+        let tokens = try tokenizer.tokenize(text)
         var stageStart = CFAbsoluteTimeGetCurrent()
         let runtime = try runtime()
         IndexTTS2StageTimer.report("runtime-load", since: &stageStart)
@@ -328,8 +329,9 @@ public final class IndexTTS2TTSModel: SpeechGenerationModel, ModelMemoryManageab
             emotionReferenceAudio: emotionReferenceAudio,
             emotionControl: emotionControl)
         IndexTTS2StageTimer.report("reference-conditioning", since: &stageStart)
-        return try runtime.synthesize(
-            textTokens: textTokens,
+        return try runtime.synthesizeSegments(
+            tokens: tokens,
+            sampleRate: sampleRate,
             conditioning: conditioning,
             synthesisOptions: synthesisOptions)
     }

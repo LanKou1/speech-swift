@@ -372,3 +372,180 @@ final class MultilingualTokenizerTests: XCTestCase {
         XCTAssertEqual(idsDefault, idsEn, "Default should route to English")
     }
 }
+
+// MARK: - Custom Pronunciation Tests
+
+/// `addPronunciations` writes into the gold dictionary, which `resolveWord`
+/// consults before the silver dict, suffix stemming, and the neural `bartG2P`
+/// fallback. These tests pin that ordering without loading the CoreML G2P
+/// models: with no models loaded `bartG2P` returns nil, so resolution falls
+/// through to the raw-letter last resort, which stands in for it here.
+/// `E2EKokoroTests.testCustomPronunciationBeatsNeuralG2P` covers the real
+/// neural fallback with downloaded weights.
+final class KokoroPronunciationTests: XCTestCase {
+
+    /// "tah-tee-AH-nuh" — a name absent from both shipped dictionaries.
+    private let tatianaIPA = "tɑtiˈɑnə"
+
+    /// Covers the IPA symbols used below plus the plain letters the raw-letter
+    /// fallback emits, so tokenization round-trips either outcome.
+    private func makeVocab() -> [String: Int] {
+        ["<pad>": 0, "<bos>": 1, "<eos>": 2,
+         "a": 3, "e": 4, "i": 5, "n": 6, "t": 7,
+         "ɑ": 8, "ə": 9, "æ": 10, "ˈ": 11, " ": 12]
+    }
+
+    private func makePhonemizer() -> KokoroPhonemizer {
+        KokoroPhonemizer(vocab: makeVocab())
+    }
+
+    /// Writes a minimal `us_gold.json` to a temp directory and loads it.
+    private func loadGoldDictionary(
+        _ entries: [String: String], into phonemizer: KokoroPhonemizer
+    ) throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+
+        let data = try JSONSerialization.data(withJSONObject: entries)
+        try data.write(to: dir.appendingPathComponent("us_gold.json"))
+        try phonemizer.loadDictionaries(from: dir)
+    }
+
+    /// The motivating case: a word in neither dictionary reaches the G2P
+    /// fallback, and an injected entry pre-empts it.
+    func testInjectedEntryPreemptsFallback() {
+        let phonemizer = makePhonemizer()
+        XCTAssertEqual(phonemizer.textToPhonemes("Tatiana"), "tatiana",
+            "With no dictionaries and no G2P models, resolution falls through to raw letters")
+
+        phonemizer.addPronunciations(["tatiana": tatianaIPA])
+
+        XCTAssertEqual(phonemizer.textToPhonemes("Tatiana"), tatianaIPA,
+            "Injected entry must be resolved instead of the fallback")
+    }
+
+    /// An injected entry outranks a shipped gold entry, so a caller can correct
+    /// a dictionary pronunciation rather than only fill a gap.
+    func testInjectedEntryOverridesGoldDictionary() throws {
+        let phonemizer = makePhonemizer()
+        try loadGoldDictionary(["tatiana": "tætiænə"], into: phonemizer)
+        XCTAssertEqual(phonemizer.textToPhonemes("Tatiana"), "tætiænə")
+
+        phonemizer.addPronunciations(["tatiana": tatianaIPA])
+
+        XCTAssertEqual(phonemizer.textToPhonemes("Tatiana"), tatianaIPA,
+            "Injected entry must outrank the shipped gold entry")
+    }
+
+    /// Entries are stored lowercased and `resolveWord` lowercases the word, so
+    /// capitalization on either side is irrelevant — proper nouns arrive
+    /// capitalized in real text.
+    func testLookupIsCaseInsensitive() {
+        let phonemizer = makePhonemizer()
+        phonemizer.addPronunciations(["TaTiAnA": tatianaIPA])
+
+        for spelling in ["tatiana", "Tatiana", "TATIANA"] {
+            XCTAssertEqual(phonemizer.textToPhonemes(spelling), tatianaIPA,
+                "\"\(spelling)\" should resolve to the injected pronunciation")
+        }
+    }
+
+    /// A later call replaces an earlier entry for the same word, and leaves the
+    /// other entries alone.
+    func testLaterCallReplacesEarlierEntry() {
+        let phonemizer = makePhonemizer()
+        phonemizer.addPronunciations(["tatiana": "tætiænə", "tania": "ˈtɑniə"])
+        phonemizer.addPronunciations(["tatiana": tatianaIPA])
+
+        XCTAssertEqual(phonemizer.textToPhonemes("tatiana"), tatianaIPA)
+        XCTAssertEqual(phonemizer.textToPhonemes("tania"), "ˈtɑniə",
+            "Unrelated entries must survive a later call")
+    }
+
+    /// Behaviour end to end: the injected IPA reaches the token ids the model
+    /// is fed, wrapped in BOS/EOS.
+    func testInjectedPronunciationSurvivesTokenization() {
+        let phonemizer = makePhonemizer()
+        let vocab = makeVocab()
+        let before = phonemizer.tokenize("Tatiana")
+
+        phonemizer.addPronunciations(["tatiana": tatianaIPA])
+        let after = phonemizer.tokenize("Tatiana")
+
+        let expected = [phonemizer.bosId] + tatianaIPA.compactMap { vocab[String($0)] }
+            + [phonemizer.eosId]
+        XCTAssertEqual(after, expected)
+        XCTAssertNotEqual(after, before, "Token ids must change once a pronunciation is injected")
+    }
+
+    /// Documented constraint: text is split on whitespace and punctuation before
+    /// resolution, so a key spanning more than one token is never looked up.
+    func testMultiTokenKeysAreNeverMatched() {
+        let phonemizer = makePhonemizer()
+        phonemizer.addPronunciations([
+            "ana maria": "ˈɑnəməˈɹiə",
+            "ana-maria": "ˈɑnəməˈɹiə",
+        ])
+
+        XCTAssertEqual(phonemizer.textToPhonemes("Ana Maria"), "ana maria",
+            "A key containing a space cannot be reached")
+        XCTAssertEqual(phonemizer.textToPhonemes("Ana-Maria"), "ana-maria",
+            "A key containing a hyphen cannot be reached")
+    }
+
+    /// Documented constraint: `specialCase` resolves before the dictionaries, so
+    /// its function words are not overridable.
+    func testSpecialCaseWordsAreNotOverridden() {
+        let phonemizer = makePhonemizer()
+        phonemizer.addPronunciations(["the": "ðiː", "of": "ɒv"])
+
+        XCTAssertEqual(phonemizer.textToPhonemes("the"), "ðə")
+        XCTAssertEqual(phonemizer.textToPhonemes("of"), "ʌv")
+    }
+
+    /// Documented constraint: `loadDictionaries` assigns the gold dictionary
+    /// rather than merging into it, so injections must come afterwards.
+    func testLoadingDictionariesDiscardsEarlierInjections() throws {
+        let phonemizer = makePhonemizer()
+        phonemizer.addPronunciations(["tatiana": tatianaIPA])
+        XCTAssertEqual(phonemizer.textToPhonemes("Tatiana"), tatianaIPA)
+
+        try loadGoldDictionary(["hello": "həlˈoʊ"], into: phonemizer)
+
+        XCTAssertEqual(phonemizer.textToPhonemes("Tatiana"), "tatiana",
+            "Entries injected before loadDictionaries do not survive it")
+    }
+
+    /// IPA symbols outside the model vocabulary are dropped at tokenization
+    /// (documented on the API), not rejected — the rest still tokenizes.
+    func testSymbolsOutsideVocabularyAreDropped() {
+        let phonemizer = makePhonemizer()
+        phonemizer.addPronunciations(["tatiana": "tɑ↗ti"])
+
+        XCTAssertEqual(phonemizer.tokenize("Tatiana"),
+            [phonemizer.bosId, 7, 8, 7, 5, phonemizer.eosId])
+    }
+
+    /// Documented constraint: only the English path consults the dictionaries.
+    /// `tokenize` routes every other language to a dedicated phonemizer, so an
+    /// injected entry is a no-op there.
+    func testInjectionAppliesToEnglishOnly() {
+        let others = ["fr", "es", "it", "pt", "hi", "ja", "zh"]
+        let phonemizer = makePhonemizer()
+        let baseline = others.map { phonemizer.tokenize("Tatiana", language: $0) }
+
+        phonemizer.addPronunciations(["tatiana": tatianaIPA])
+
+        let vocab = makeVocab()
+        XCTAssertEqual(phonemizer.tokenize("Tatiana", language: "en"),
+            [phonemizer.bosId] + tatianaIPA.compactMap { vocab[String($0)] } + [phonemizer.eosId],
+            "English must resolve the injected entry")
+
+        for (language, before) in zip(others, baseline) {
+            XCTAssertEqual(phonemizer.tokenize("Tatiana", language: language), before,
+                "\"\(language)\" must be unaffected by the injected entry")
+        }
+    }
+}

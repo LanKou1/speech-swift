@@ -20,6 +20,7 @@ import VibeVoiceTTS
 import PersonaPlex
 import HibikiTranslate
 import SpeechEnhancement
+import SpeechVAD
 import AudioCommon
 
 // MARK: - Server
@@ -351,6 +352,7 @@ func realtimeWebSocketServerConfiguration() -> WebSocketServerConfiguration {
 // MARK: - Lazy Model State
 
 protocol RealtimeModelLoading: Sendable {
+    func loadVAD() async throws -> any StreamingVADProvider
     func loadQwen3ASR(modelId: String) async throws -> Qwen3ASRModel
     func loadParakeet(modelId: String) async throws -> ParakeetASRModel
     func loadParakeetStreaming(modelId: String) async throws -> ParakeetStreamingASRModel
@@ -381,16 +383,25 @@ struct RealtimeModelLoadingFailure: Error, CustomStringConvertible {
 final class FailingRealtimeModelLoading: RealtimeModelLoading, @unchecked Sendable {
     let error: Error
     let beforeFailure: (@Sendable () -> Void)?
+    let vadOverride: (any StreamingVADProvider)?
 
     init(
         error: Error = RealtimeModelLoadingFailure(),
-        beforeFailure: (@Sendable () -> Void)? = nil
+        beforeFailure: (@Sendable () -> Void)? = nil,
+        vadOverride: (any StreamingVADProvider)? = nil
     ) {
         self.error = error
         self.beforeFailure = beforeFailure
+        self.vadOverride = vadOverride
     }
 
     private func fail<T>() async throws -> T {
+        beforeFailure?()
+        throw error
+    }
+
+    func loadVAD() async throws -> any StreamingVADProvider {
+        if let vadOverride { return vadOverride }
         beforeFailure?()
         throw error
     }
@@ -488,6 +499,17 @@ final class ModelState: RealtimeModelLoading, @unchecked Sendable {
     private var hibikiByModelId: [String: HibikiTranslateModel] = [:]
     private var enhancer: SpeechEnhancer?
     var spmDecoder: SentencePieceDecoder?
+
+    func loadVAD() async throws -> any StreamingVADProvider {
+        // Silero carries recurrent/context state. Give every websocket session
+        // its own instance so clear/reset and concurrent turns cannot corrupt
+        // another client's detector state. The downloaded bundle remains in
+        // the shared on-disk model cache.
+        print("[server] Loading Silero VAD...")
+        return try await SileroVADModel.fromPretrained(
+            engine: .coreml,
+            progressHandler: logProgress)
+    }
 
     func loadQwen3ASR(modelId: String) async throws -> Qwen3ASRModel {
         if let m = qwen3ASR[modelId] { return m }
@@ -726,6 +748,12 @@ private final class RealtimeSession {
     var voiceCloneReferenceText: String?
     var inputAudioBuffer = Data()
     var inputSampleRate: Int = 24000
+    /// Nil keeps explicit-commit behavior. A value enables automatic turns.
+    var turnDetection: RealtimeTurnDetectionConfig?
+    var vadController: RealtimeVADController?
+    var activeInputItemId: String?
+    /// A single trailing byte when websocket PCM16 frames split a sample.
+    var vadPCM16Carry = Data()
     /// Audio captured by the last `input_audio_buffer.commit`, kept at the
     /// protocol sample rate (24 kHz mono Float32). The S2S path reads from
     /// here on the following `response.create`. Cleared after use.
@@ -749,6 +777,65 @@ private final class RealtimeSession {
     var engineEcho: String {
         return legacyEngine ?? ttsVariant.engine
     }
+}
+
+private enum RealtimeTurnDetectionConfigurationError: Error, LocalizedError {
+    case unsupportedType(String)
+    case invalidValue(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedType(let type):
+            return "Unsupported turn_detection type '\(type)'"
+        case .invalidValue(let field):
+            return "Invalid turn_detection.\(field) value"
+        }
+    }
+}
+
+private func parseRealtimeTurnDetection(
+    _ value: Any
+) throws -> RealtimeTurnDetectionConfig? {
+    if value is NSNull { return nil }
+    guard let object = value as? [String: Any] else {
+        throw RealtimeTurnDetectionConfigurationError.invalidValue("type")
+    }
+    let type = object["type"] as? String ?? "server_vad"
+    if type == "none" { return nil }
+    guard type == "server_vad" else {
+        throw RealtimeTurnDetectionConfigurationError.unsupportedType(type)
+    }
+
+    var config = RealtimeTurnDetectionConfig()
+    if let number = object["threshold"] as? NSNumber {
+        let value = number.floatValue
+        guard value >= 0, value <= 1 else {
+            throw RealtimeTurnDetectionConfigurationError.invalidValue("threshold")
+        }
+        config.threshold = value
+    }
+    if let number = object["prefix_padding_ms"] as? NSNumber {
+        let value = number.intValue
+        guard value >= 0, value <= 10_000 else {
+            throw RealtimeTurnDetectionConfigurationError.invalidValue("prefix_padding_ms")
+        }
+        config.prefixPaddingMilliseconds = value
+    }
+    if let number = object["silence_duration_ms"] as? NSNumber {
+        let value = number.intValue
+        guard value >= 0, value <= 60_000 else {
+            throw RealtimeTurnDetectionConfigurationError.invalidValue("silence_duration_ms")
+        }
+        config.silenceDurationMilliseconds = value
+    }
+    if let number = object["max_turn_duration_ms"] as? NSNumber {
+        let value = number.intValue
+        guard value >= 1_000, value <= 600_000 else {
+            throw RealtimeTurnDetectionConfigurationError.invalidValue("max_turn_duration_ms")
+        }
+        config.maxTurnDurationMilliseconds = value
+    }
+    return config
 }
 
 /// Resolve a model name to its ASR variant, if any.
@@ -875,7 +962,7 @@ func handleRealtimeWS(
                             case .tts: session.ttsVariant = v
                             case .s2s: session.s2sVariant = v
                             case .enhance, .music, .vad, .diarize,
-                                 .speaker, .separate, .sr:
+                                 .speaker, .separate, .sr, .turn:
                                 // Cataloged in the registry for discovery via
                                 // /v1/models, but the Realtime session protocol
                                 // has no slot for these — they're routed via
@@ -918,6 +1005,16 @@ func handleRealtimeWS(
                     if let fmt = sessionConfig["input_audio_format"] as? String, fmt == "pcm16" {
                         session.inputSampleRate = 24000
                     }
+                    if let rawTurnDetection = sessionConfig["turn_detection"] {
+                        let updatedTurnDetection = try parseRealtimeTurnDetection(
+                            rawTurnDetection)
+                        session.vadController?.reset()
+                        session.vadController = nil
+                        session.activeInputItemId = nil
+                        session.vadPCM16Carry.removeAll(keepingCapacity: false)
+                        session.inputAudioBuffer.removeAll(keepingCapacity: false)
+                        session.turnDetection = updatedTurnDetection
+                    }
                     // Voice-cloning reference. PCM16 24 kHz, base64-encoded.
                     // Setting this routes the next response.create to VoxCPM2
                     // regardless of the active TTS engine. Guard against empty
@@ -944,103 +1041,95 @@ func handleRealtimeWS(
                     try await sendRealtimeError(outbound: outbound, message: "Missing or invalid 'audio' field")
                     continue
                 }
-                session.inputAudioBuffer.append(audioData)
+                if let turnDetection = session.turnDetection {
+                    if session.vadController == nil {
+                        let vad = try await state.loadVAD()
+                        session.vadController = try RealtimeVADController(
+                            provider: vad,
+                            config: turnDetection,
+                            inputSampleRate: session.inputSampleRate)
+                    }
+                    let samples = decodeRealtimeVADPCM16(
+                        audioData,
+                        carry: &session.vadPCM16Carry)
+                    let events = try session.vadController?.push(samples) ?? []
+                    for event in events {
+                        switch event {
+                        case .speechStarted(let audioStartMilliseconds):
+                            let itemId = UUID().uuidString
+                            session.activeInputItemId = itemId
+                            try await outbound.write(.text(formatJSON([
+                                "type": "input_audio_buffer.speech_started",
+                                "audio_start_ms": audioStartMilliseconds,
+                                "item_id": itemId,
+                            ] as [String: Any])))
+
+                        case .speechEnded(
+                            let audioEndMilliseconds,
+                            let audio,
+                            let forcedByDurationLimit):
+                            let itemId = session.activeInputItemId ?? UUID().uuidString
+                            session.activeInputItemId = nil
+                            try await outbound.write(.text(formatJSON([
+                                "type": "input_audio_buffer.speech_stopped",
+                                "audio_end_ms": audioEndMilliseconds,
+                                "item_id": itemId,
+                                "forced": forcedByDurationLimit,
+                            ] as [String: Any])))
+                            if !audio.isEmpty {
+                                try await commitRealtimeInputAudio(
+                                    audio24k: audio,
+                                    itemId: itemId,
+                                    session: session,
+                                    outbound: outbound,
+                                    state: state)
+                            }
+                        }
+                    }
+                } else {
+                    guard session.inputAudioBuffer.count <= realtimeMaxExplicitInputBufferBytes,
+                          audioData.count <= realtimeMaxExplicitInputBufferBytes
+                            - session.inputAudioBuffer.count else {
+                        session.inputAudioBuffer.removeAll(keepingCapacity: false)
+                        try await sendRealtimeError(
+                            outbound: outbound,
+                            message: "Input audio buffer exceeded the 5-minute limit")
+                        continue
+                    }
+                    session.inputAudioBuffer.append(audioData)
+                }
 
             case "input_audio_buffer.clear":
                 session.inputAudioBuffer.removeAll()
+                session.vadController?.reset()
+                session.activeInputItemId = nil
+                session.vadPCM16Carry.removeAll(keepingCapacity: false)
                 try await outbound.write(.text(formatJSON([
                     "type": "input_audio_buffer.cleared"
                 ])))
 
             case "input_audio_buffer.commit":
-                let audioData = session.inputAudioBuffer
-                session.inputAudioBuffer.removeAll()
+                let audio: [Float]
+                if let controller = session.vadController {
+                    audio = controller.takeBufferedAudio()
+                    session.activeInputItemId = nil
+                    session.vadPCM16Carry.removeAll(keepingCapacity: false)
+                } else {
+                    let audioData = session.inputAudioBuffer
+                    session.inputAudioBuffer.removeAll()
+                    audio = pcm16LEToFloat(audioData)
+                }
 
-                guard !audioData.isEmpty else {
+                guard !audio.isEmpty else {
                     try await sendRealtimeError(outbound: outbound, message: "Audio buffer is empty")
                     continue
                 }
-
-                let itemId = UUID().uuidString
-                try await outbound.write(.text(formatJSON([
-                    "type": "input_audio_buffer.committed",
-                    "item_id": itemId
-                ])))
-
-                let floats24k = pcm16LEToFloat(audioData)
-
-                // S2S precedence: when an S2S variant is active, commit stores
-                // the audio at the protocol rate (24 kHz mono) for the next
-                // response.create to consume. No transcription is emitted —
-                // the S2S model produces text as part of generation.
-                if session.s2sVariant != nil {
-                    session.lastCommittedAudio = floats24k
-                    continue
-                }
-
-                // Compose path: transcribe via the active ASR variant. Every
-                // ASR engine expects 16 kHz mono Float32; resample once.
-                let audio16k = resample(floats24k, from: session.inputSampleRate, to: 16000)
-                let asr = session.asrVariant
-                let text: String
-                switch asr.engine {
-                case "parakeet":
-                    text = try await runOffloaded {
-                        let model = try await state.loadParakeet(modelId: asr.modelId)
-                        return (try? model.transcribeAudio(audio16k, sampleRate: 16000, language: nil)) ?? ""
-                    }
-                case "parakeet-streaming":
-                    text = try await runOffloaded {
-                        let model = try await state.loadParakeetStreaming(modelId: asr.modelId)
-                        return (try? model.transcribeAudio(audio16k, sampleRate: 16000, language: session.language)) ?? ""
-                    }
-                case "nemotron":
-                    text = try await runOffloaded {
-                        let model = try await state.loadNemotron(modelId: asr.modelId)
-                        return (try? model.transcribeAudio(audio16k, sampleRate: 16000, language: session.language)) ?? ""
-                    }
-                case "omnilingual":
-                    text = try await runOffloaded {
-                        let model = try await state.loadOmnilingual(modelId: asr.modelId)
-                        return (try? model.transcribeAudio(audio16k, sampleRate: 16000, language: session.language)) ?? ""
-                    }
-                case "qwen3-asr":
-                    text = try await runOffloaded {
-                        let model = try await state.loadQwen3ASR(modelId: asr.modelId)
-                        return model.transcribe(audio: audio16k, sampleRate: 16000)
-                    }
-                default:
-                    try await sendRealtimeError(outbound: outbound,
-                        message: "ASR engine '\(asr.engine)' is not enabled in this build")
-                    continue
-                }
-
-                let responseId = UUID().uuidString
-                try await outbound.write(.text(formatJSON([
-                    "type": "conversation.item.input_audio_transcription.completed",
-                    "item_id": itemId,
-                    "transcript": text
-                ])))
-
-                // Also emit as a response for clients expecting response.* events
-                try await outbound.write(.text(formatJSON([
-                    "type": "response.created",
-                    "response": ["id": responseId, "status": "in_progress"]
-                ] as [String: Any])))
-                try await outbound.write(.text(formatJSON([
-                    "type": "response.audio_transcript.delta",
-                    "response_id": responseId,
-                    "delta": text
-                ])))
-                try await outbound.write(.text(formatJSON([
-                    "type": "response.audio_transcript.done",
-                    "response_id": responseId,
-                    "transcript": text
-                ])))
-                try await outbound.write(.text(formatJSON([
-                    "type": "response.done",
-                    "response": ["id": responseId, "status": "completed"]
-                ] as [String: Any])))
+                try await commitRealtimeInputAudio(
+                    audio24k: audio,
+                    itemId: UUID().uuidString,
+                    session: session,
+                    outbound: outbound,
+                    state: state)
 
             case "response.create":
                 let input = json["response"] as? [String: Any]
@@ -1393,6 +1482,25 @@ private func sendRealtimeError(
 
 private let realtimeKeepaliveIntervalNanoseconds: UInt64 = 15_000_000_000
 private let realtimeKeepaliveEvent = "realtime.keepalive"
+/// Five minutes of mono PCM16 at the realtime protocol's 24 kHz sample rate.
+private let realtimeMaxExplicitInputBufferBytes = 5 * 60 * 24_000 * 2
+
+/// Decode complete little-endian PCM16 samples while retaining at most one
+/// byte across websocket messages. Network frames need not align to samples.
+private func decodeRealtimeVADPCM16(
+    _ data: Data,
+    carry: inout Data
+) -> [Float] {
+    var joined = carry
+    joined.append(data)
+    if joined.count.isMultiple(of: 2) {
+        carry.removeAll(keepingCapacity: true)
+    } else {
+        carry = Data(joined.suffix(1))
+        joined.removeLast()
+    }
+    return pcm16LEToFloat(joined)
+}
 
 /// Run `operation` on a detached task so the calling websocket handler's
 /// executor stays free to deliver the session-scoped `realtime.keepalive`
@@ -1409,6 +1517,63 @@ private func runOffloaded<T: Sendable>(
     } onCancel: {
         task.cancel()
     }
+}
+
+/// Commit one explicit or VAD-closed input turn and emit the same realtime
+/// transcription sequence for both paths.
+private func commitRealtimeInputAudio(
+    audio24k: [Float],
+    itemId: String,
+    session: RealtimeSession,
+    outbound: WebSocketOutboundWriter,
+    state: any RealtimeModelLoading
+) async throws {
+    try await outbound.write(.text(formatJSON([
+        "type": "input_audio_buffer.committed",
+        "item_id": itemId,
+    ])))
+
+    if session.s2sVariant != nil {
+        session.lastCommittedAudio = audio24k
+        return
+    }
+
+    let variant = session.asrVariant
+    let language = session.language
+    let sampleRate = session.inputSampleRate
+    let text = try await runOffloaded {
+        try await dispatchTranscribe(
+            audio: audio24k,
+            sampleRate: sampleRate,
+            variant: variant,
+            language: language,
+            state: state)
+    }
+
+    let responseId = UUID().uuidString
+    try await outbound.write(.text(formatJSON([
+        "type": "conversation.item.input_audio_transcription.completed",
+        "item_id": itemId,
+        "transcript": text,
+    ])))
+    try await outbound.write(.text(formatJSON([
+        "type": "response.created",
+        "response": ["id": responseId, "status": "in_progress"],
+    ] as [String: Any])))
+    try await outbound.write(.text(formatJSON([
+        "type": "response.audio_transcript.delta",
+        "response_id": responseId,
+        "delta": text,
+    ])))
+    try await outbound.write(.text(formatJSON([
+        "type": "response.audio_transcript.done",
+        "response_id": responseId,
+        "transcript": text,
+    ])))
+    try await outbound.write(.text(formatJSON([
+        "type": "response.done",
+        "response": ["id": responseId, "status": "completed"],
+    ] as [String: Any])))
 }
 
 /// Build a `session.created` / `session.updated` envelope.
@@ -1431,6 +1596,17 @@ private func sessionEnvelope(id: String, session: RealtimeSession, type: String)
         "input_audio_format": "pcm16",
         "output_audio_format": "pcm16"
     ]
+    if let turnDetection = session.turnDetection {
+        payload["turn_detection"] = [
+            "type": "server_vad",
+            "threshold": turnDetection.threshold,
+            "prefix_padding_ms": turnDetection.prefixPaddingMilliseconds,
+            "silence_duration_ms": turnDetection.silenceDurationMilliseconds,
+            "max_turn_duration_ms": turnDetection.maxTurnDurationMilliseconds,
+        ] as [String: Any]
+    } else {
+        payload["turn_detection"] = NSNull()
+    }
     if let s2s = session.s2sVariant {
         payload["s2s_engine"] = s2s.engine
         payload["s2s_model"] = s2s.name
@@ -1482,13 +1658,15 @@ private func streamSamplesAsDeltas(
 ///
 /// Returns an empty string on engine-level errors (matching the WS path's
 /// `try?` shape) so the calling route can return an empty transcript
-/// rather than a 500.
+/// rather than a 500. Task cancellation is the exception: the Qwen3-ASR
+/// path throws `CancellationError` at its next decoder checkpoint so an
+/// abandoned request releases the GPU instead of decoding to EOS.
 func dispatchTranscribe(
     audio: [Float],
     sampleRate: Int,
     variant: ModelVariant,
     language: String?,
-    state: ModelState
+    state: any RealtimeModelLoading
 ) async throws -> String {
     let audio16k: [Float] = sampleRate == 16000
         ? audio
@@ -1508,7 +1686,7 @@ func dispatchTranscribe(
         return (try? model.transcribeAudio(audio16k, sampleRate: 16000, language: language)) ?? ""
     case "qwen3-asr":
         let model = try await state.loadQwen3ASR(modelId: variant.modelId)
-        return model.transcribe(audio: audio16k, sampleRate: 16000)
+        return try model.transcribeCheckingCancellation(audio: audio16k, sampleRate: 16000)
     default:
         throw RealtimeDispatchError.engineNotEnabled(kind: "ASR", engine: variant.engine)
     }

@@ -20,9 +20,11 @@ make build
 ## Flags
 
 ```
---variant {fp16,int8}   # precision variant (default fp16)
---model, -m REPO        # HuggingFace repo id (default aufklarer/Sidon-CoreML)
---output, -o PATH       # output WAV path (default <input>_restored.wav, 48 kHz)
+--variant {fp16,int8}          # precision variant (default fp16)
+--model, -m REPO               # HuggingFace repo id (default aufklarer/Sidon-CoreML)
+--output, -o PATH              # output WAV path (default <input>_restored.wav, 48 kHz)
+--compute-units {ane,gpu,cpu,all}  # Core ML placement for both stages
+                               # (default: predictor all, vocoder gpu — see below)
 ```
 
 ## Input handling
@@ -33,6 +35,40 @@ make build
 - Output is 48 kHz mono, trimmed to the input's true duration on the 48 kHz
   timeline (each window emits a fixed number of samples regardless of how much
   of it was real audio, so partial-window padding is removed).
+
+## Compute placement
+
+The two Core ML stages are placed independently (`SidonComputePlacement`):
+
+| Stage | Default | Why |
+|---|---|---|
+| Predictor (w2v-BERT 2.0, 8 layers) | `.all` | regular transformer; ANE-friendly (~3 s load, ~60 ms per window) |
+| Vocoder (DAC decoder, ×960) | `.cpuAndGPU` | its late layers are convolutions over ~480k-sample-wide tensors; the Neural Engine compiler spends **minutes** spatially tiling them and can fail outright (M5 Pro / macOS 26.5: 159 s then `ANECCompile() FAILED`, silent fallback ~12× slower than CPU). On the GPU it loads in ~0.3 s and runs a window in ~0.2 s. |
+
+Nothing about the export helps here — the `.mlpackage → .mlmodelc` compile is
+~0.1 s; the expensive part is the per-device ANE program that Core ML generates
+at `MLModel` load time, which cannot be shipped precompiled.
+
+Overrides, highest precedence first:
+
+1. `SPEECH_COREML_COMPUTE_UNITS=ane|gpu|cpu|all` — env, applies to every Core ML
+   model in the process (CI forces `cpu`).
+2. `--compute-units ane|gpu|cpu|all` — CLI, both stages.
+3. API — per stage wins over uniform:
+
+```swift
+// defaults: predictor .all, vocoder .cpuAndGPU
+let restorer = try await SpeechRestorer.fromPretrained()
+
+// uniform
+let cpu = try await SpeechRestorer.fromPretrained(computeUnits: .cpuOnly)
+
+// per stage (opt the vocoder back onto the ANE for a long-lived server that
+// can afford the one-time compile)
+let ane = try await SpeechRestorer.fromPretrained(vocoderComputeUnits: .all)
+
+restorer.placement.vocoder   // → .cpuAndGPU
+```
 
 ## Clean a voice-cloning reference (`speak --clean-reference`)
 

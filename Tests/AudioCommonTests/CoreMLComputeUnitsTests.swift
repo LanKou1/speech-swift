@@ -46,5 +46,40 @@ final class CoreMLComputeUnitsResolverTests: XCTestCase {
             XCTAssertEqual(CoreMLComputeUnitsResolver.resolved(default: .cpuAndNeuralEngine), .cpuAndNeuralEngine)
         }
     }
+
+    // MARK: - parse / shortName (shared CLI + env vocabulary)
+
+    func testParseAcceptsTheSharedVocabulary() {
+        XCTAssertEqual(CoreMLComputeUnitsResolver.parse("ane"), .cpuAndNeuralEngine)
+        XCTAssertEqual(CoreMLComputeUnitsResolver.parse("neuralEngine"), .cpuAndNeuralEngine)
+        XCTAssertEqual(CoreMLComputeUnitsResolver.parse("cpuAndNeuralEngine"), .cpuAndNeuralEngine)
+        XCTAssertEqual(CoreMLComputeUnitsResolver.parse("gpu"), .cpuAndGPU)
+        XCTAssertEqual(CoreMLComputeUnitsResolver.parse("cpuAndGPU"), .cpuAndGPU)
+        XCTAssertEqual(CoreMLComputeUnitsResolver.parse("cpu"), .cpuOnly)
+        XCTAssertEqual(CoreMLComputeUnitsResolver.parse("cpuOnly"), .cpuOnly)
+        XCTAssertEqual(CoreMLComputeUnitsResolver.parse("all"), .all)
+        XCTAssertEqual(CoreMLComputeUnitsResolver.parse("  GPU\n"), .cpuAndGPU, "case/whitespace-insensitive")
+    }
+
+    func testParseRejectsUnknownAndEmpty() {
+        XCTAssertNil(CoreMLComputeUnitsResolver.parse(""))
+        XCTAssertNil(CoreMLComputeUnitsResolver.parse("   "))
+        XCTAssertNil(CoreMLComputeUnitsResolver.parse("banana"))
+        XCTAssertNil(CoreMLComputeUnitsResolver.parse("metal"))
+    }
+
+    func testShortNameRoundTripsThroughParse() {
+        for units in [MLComputeUnits.cpuOnly, .cpuAndGPU, .cpuAndNeuralEngine, .all] {
+            let name = CoreMLComputeUnitsResolver.shortName(units)
+            XCTAssertEqual(CoreMLComputeUnitsResolver.parse(name), units, "shortName(\(name)) must parse back")
+        }
+        XCTAssertEqual(CoreMLComputeUnitsResolver.shortName(.cpuAndGPU), "gpu")
+    }
+
+    func testEmptyEnvFallsBack() {
+        withEnv("") {
+            XCTAssertEqual(CoreMLComputeUnitsResolver.resolved(default: .cpuAndGPU), .cpuAndGPU)
+        }
+    }
 }
 #endif

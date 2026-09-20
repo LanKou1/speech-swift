@@ -30,6 +30,15 @@ public struct VadStreamCommand: ParsableCommand {
     @Option(name: .long, help: "Minimum silence duration in seconds")
     public var minSilence: Float = VADConfig.sileroDefault.minSilenceDuration
 
+    @Flag(name: .long, help: "Confirm each pause with Smart Turn before ending a segment")
+    public var smartTurn: Bool = false
+
+    @Option(name: .long, help: "Smart Turn completion threshold")
+    public var turnThreshold: Float = SmartTurnModel.defaultThreshold
+
+    @Option(name: .long, help: "Seconds of silence after a vetoed pause that end the segment anyway")
+    public var turnMaxSilence: Float = TurnCompletionConfig.default.maxSilenceDuration
+
     @Flag(name: .long, help: "Output as JSON")
     public var json: Bool = false
 
@@ -65,9 +74,26 @@ public struct VadStreamCommand: ParsableCommand {
                 stepRatio: VADConfig.sileroDefault.stepRatio
             )
 
-            let processor = StreamingVADProcessor(model: vadModel, config: vadConfig)
+            var turnModel: TurnCompletionProvider?
+            if smartTurn {
+                #if canImport(CoreML)
+                print("Loading Smart Turn model: \(SmartTurnModel.defaultModelId)")
+                turnModel = try await SmartTurnModel.fromPretrained(progressHandler: reportProgress)
+                #else
+                print("Error: --smart-turn needs CoreML, which is unavailable on this platform.")
+                return
+                #endif
+            }
 
-            print("Processing in 32ms chunks...")
+            let processor = StreamingVADProcessor(
+                model: vadModel,
+                config: vadConfig,
+                turnCompletion: turnModel,
+                turnCompletionConfig: TurnCompletionConfig(
+                    threshold: turnThreshold, maxSilenceDuration: turnMaxSilence))
+
+            print(smartTurn ? "Processing in 32ms chunks (Smart Turn confirms each pause)..."
+                            : "Processing in 32ms chunks...")
             let start = Date()
             var allEvents = [VADEvent]()
 

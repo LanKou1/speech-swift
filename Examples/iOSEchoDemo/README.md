@@ -20,6 +20,7 @@ Models (~500 MB) download from HuggingFace on first launch.
 ## Features
 
 - Voice activity detection (Silero VAD)
+- End-of-turn detection (Smart Turn v3.2, CoreML): a pause only ends the turn once the classifier agrees, so a mid-sentence pause does not trigger a reply
 - Force-cut at 5s with system message
 - Adaptive echo prevention (cooldown based on TTS audio duration)
 - Diagnostics view (CPU, memory, VAD level)

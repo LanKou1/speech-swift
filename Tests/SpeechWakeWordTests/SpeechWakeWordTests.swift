@@ -345,6 +345,124 @@ final class ContextGraphTests: XCTestCase {
 
 final class StreamingKwsDecoderTests: XCTestCase {
 
+    func testDecodingOptionsDefaultsPreserveModelOwnedValues() {
+        let options = WakeWordDecodingOptions()
+        XCTAssertEqual(options.beam, 4)
+        XCTAssertNil(options.numTrailingBlanks)
+        XCTAssertEqual(options.blankPenalty, 0)
+        XCTAssertNil(options.autoResetSeconds)
+    }
+
+    func testDecodingOptionsAcceptDocumentedBounds() throws {
+        for beam in [
+            WakeWordDecodingOptions.supportedBeamRange.lowerBound,
+            WakeWordDecodingOptions.supportedBeamRange.upperBound
+        ] {
+            let resolved = try WakeWordDecodingOptions(
+                beam: beam,
+                autoResetSeconds: WakeWordDecodingOptions.maximumAutoResetSeconds
+            ).resolved(defaultNumTrailingBlanks: 1, defaultAutoResetSeconds: 1.5)
+            XCTAssertEqual(resolved.beam, beam)
+            XCTAssertEqual(
+                resolved.autoResetSeconds,
+                WakeWordDecodingOptions.maximumAutoResetSeconds
+            )
+        }
+    }
+
+    func testDecodingOptionsRejectPathologicalBeamWidths() {
+        for beam in [-1, 0, 33, Int.max] {
+            XCTAssertThrowsError(
+                try WakeWordDecodingOptions(beam: beam).resolved(
+                    defaultNumTrailingBlanks: 1,
+                    defaultAutoResetSeconds: 1.5
+                ),
+                "beam \(beam) should be rejected before decoder allocation"
+            )
+        }
+    }
+
+    func testDecodingOptionsRejectUnsafeAutoResetDurations() {
+        let invalidDurations: [Double] = [
+            -1,
+            0,
+            .infinity,
+            .nan,
+            WakeWordDecodingOptions.maximumAutoResetSeconds.nextUp,
+            .greatestFiniteMagnitude
+        ]
+        for duration in invalidDurations {
+            XCTAssertThrowsError(
+                try WakeWordDecodingOptions(autoResetSeconds: duration).resolved(
+                    defaultNumTrailingBlanks: 1,
+                    defaultAutoResetSeconds: 1.5
+                ),
+                "auto-reset duration \(duration) should be rejected"
+            )
+        }
+
+        XCTAssertThrowsError(
+            try WakeWordDecodingOptions().resolved(
+                defaultNumTrailingBlanks: 1,
+                defaultAutoResetSeconds: .greatestFiniteMagnitude
+            ),
+            "invalid model-owned defaults must not bypass validation"
+        )
+    }
+
+    func testAutoResetFrameConversionCannotTrapOnHugeFiniteValues() {
+        XCTAssertEqual(
+            StreamingKwsDecoder.safeAutoResetFrameCount(
+                seconds: .greatestFiniteMagnitude,
+                frameShiftSeconds: 0.04
+            ),
+            Int.max
+        )
+        XCTAssertEqual(
+            StreamingKwsDecoder.safeAutoResetFrameCount(
+                seconds: 10,
+                frameShiftSeconds: 0.04
+            ),
+            250
+        )
+        XCTAssertEqual(
+            StreamingKwsDecoder.safeAutoResetFrameCount(
+                seconds: .nan,
+                frameShiftSeconds: 0.04
+            ),
+            1
+        )
+    }
+
+    func testDirectDecoderClampsUnsafeBeamWidth() {
+        let graph = ContextGraph(contextScore: 0.5)
+        graph.build(tokenIds: [[1]], phrases: ["WAKE"], boosts: [0], thresholds: [0])
+        let decoderFn: StreamingKwsDecoder.DecoderFn = { _ in [0] }
+        let joinerFn: StreamingKwsDecoder.JoinerFn = { _, _ in [0, 0] }
+
+        let tooWide = StreamingKwsDecoder(
+            decoderFn: decoderFn,
+            joinerFn: joinerFn,
+            contextGraph: graph,
+            beam: Int.max
+        )
+        let nonPositive = StreamingKwsDecoder(
+            decoderFn: decoderFn,
+            joinerFn: joinerFn,
+            contextGraph: graph,
+            beam: Int.min
+        )
+
+        XCTAssertEqual(
+            tooWide.beam,
+            WakeWordDecodingOptions.supportedBeamRange.upperBound
+        )
+        XCTAssertEqual(
+            nonPositive.beam,
+            WakeWordDecodingOptions.supportedBeamRange.lowerBound
+        )
+    }
+
     /// Tiny backend: blank-only logits. Drives the beam to blanks forever.
     private func blankOnlyBackend(vocab: Int = 4) -> (StreamingKwsDecoder.DecoderFn, StreamingKwsDecoder.JoinerFn) {
         let decFn: StreamingKwsDecoder.DecoderFn = { _ in [Float](repeating: 0, count: 8) }
@@ -370,6 +488,85 @@ final class StreamingKwsDecoderTests: XCTestCase {
     func testLogAddExpStableAtInfinity() {
         XCTAssertEqual(StreamingKwsDecoder.logAddExp(-.infinity, 3.0), 3.0)
         XCTAssertEqual(StreamingKwsDecoder.logAddExp(3.0, -.infinity), 3.0)
+    }
+
+    func testBoundedTopCandidatesMatchesFullSortAcrossBeamsAndLogits() {
+        let hypothesisScores: [Double] = [-4.25, -1.5, 0, 0.75, 0.75]
+        let logitSets: [[Float]] = [
+            [8, 3, 1, -2, -9, -20],
+            [0, 0, 0, 0, 0, 0],
+            [2, -1, 2, -1, 2, -1],
+            [-Float.infinity, -3, -3, -7, -7, -Float.infinity]
+        ]
+
+        var candidates: [StreamingKwsDecoder.Candidate] = []
+        var insertionOrder = 0
+        for (hypIndex, hypothesisScore) in hypothesisScores.enumerated() {
+            for logits in logitSets {
+                let (logProbs, probs) = StreamingKwsDecoder.logSoftmax(logits)
+                for token in logits.indices {
+                    candidates.append(
+                        StreamingKwsDecoder.Candidate(
+                            totalLogProb: hypothesisScore + Double(logProbs[token]),
+                            hypIndex: hypIndex,
+                            token: token,
+                            tokenProb: Double(probs[token]),
+                            insertionOrder: insertionOrder
+                        )
+                    )
+                    insertionOrder += 1
+                }
+            }
+        }
+
+        for beam in [1, 2, 4, 8, 16, 32, candidates.count, candidates.count + 5] {
+            let reference = Array(candidates.sorted {
+                StreamingKwsDecoder.candidateRanksBefore($0, $1)
+            }.prefix(beam))
+            let bounded = StreamingKwsDecoder.boundedTopCandidates(
+                candidates,
+                limit: beam
+            )
+            XCTAssertEqual(bounded, reference, "bounded selection diverged at beam \(beam)")
+        }
+    }
+
+    func testBoundedTopCandidatesPreservesEnumerationOrderAcrossScoreTies() {
+        let candidates = (0..<64).map { index in
+            StreamingKwsDecoder.Candidate(
+                totalLogProb: -2,
+                hypIndex: index / 8,
+                token: index % 8,
+                tokenProb: 0.125,
+                insertionOrder: index
+            )
+        }
+
+        for beam in [1, 2, 4, 8, 16, 32, 64] {
+            let bounded = StreamingKwsDecoder.boundedTopCandidates(
+                candidates,
+                limit: beam
+            )
+            XCTAssertEqual(
+                bounded.map(\.insertionOrder),
+                Array(0..<beam),
+                "equal-score candidates must retain the prior enumeration order"
+            )
+        }
+    }
+
+    func testBoundedTopCandidatesRejectsNonPositiveLimit() {
+        let candidate = StreamingKwsDecoder.Candidate(
+            totalLogProb: 0,
+            hypIndex: 0,
+            token: 0,
+            tokenProb: 1,
+            insertionOrder: 0
+        )
+        XCTAssertEqual(
+            StreamingKwsDecoder.boundedTopCandidates([candidate], limit: 0),
+            []
+        )
     }
 
     func testBlankOnlyProducesNoEmissions() {
@@ -453,6 +650,65 @@ final class StreamingKwsDecoderTests: XCTestCase {
         }
         // No crash + beam still populated (single initial hypothesis).
         XCTAssertFalse(decoder.beamList.isEmpty)
+    }
+
+    func testSessionStreamClockSurvivesDecoderAutoAndEmissionResets() {
+        let graph = ContextGraph(contextScore: 2, acThreshold: 0)
+        graph.build(
+            tokenIds: [[1]], phrases: ["WAKE"], boosts: [0], thresholds: [0]
+        )
+        let decoderFn: StreamingKwsDecoder.DecoderFn = { _ in
+            [Float](repeating: 0, count: 8)
+        }
+        var emitToken = false
+        let joinerFn: StreamingKwsDecoder.JoinerFn = { _, _ in
+            emitToken ? [-10, 10, -10] : [10, -10, -10]
+        }
+        let decoder = StreamingKwsDecoder(
+            decoderFn: decoderFn,
+            joinerFn: joinerFn,
+            contextGraph: graph,
+            blankId: 0,
+            contextSize: 2,
+            beam: 1,
+            numTrailingBlanks: 0,
+            frameShiftSeconds: 0.04,
+            autoResetSeconds: 0.08
+        )
+        var streamClock = WakeWordStreamClock()
+        var detections: [KeywordDetection] = []
+        var rawDetections: [KeywordDetection] = []
+
+        // The first two blank frames force an automatic decoder reset. Each
+        // token/blank pair then emits and resets the decoder again.
+        for shouldEmitToken in [false, false, true, false, true, false] {
+            emitToken = shouldEmitToken
+            let raw = decoder.step(encoderFrame: [Float](repeating: 0, count: 8))
+            rawDetections.append(contentsOf: raw)
+            detections.append(contentsOf: streamClock.stamp(raw))
+        }
+
+        XCTAssertEqual(rawDetections.count, 2)
+        XCTAssertTrue(rawDetections.allSatisfy { $0.streamFrameIndex == nil })
+        XCTAssertTrue(rawDetections.allSatisfy { $0.streamTimestamps == nil })
+        XCTAssertEqual(detections.map(\.frameIndex), [1, 2])
+        XCTAssertEqual(detections.compactMap(\.streamFrameIndex), [3, 5])
+        XCTAssertEqual(detections.compactMap(\.streamTimestamps), [[2], [4]])
+        XCTAssertEqual(detections[0].streamTime(frameShiftSeconds: 0.04), 0.12)
+        XCTAssertEqual(detections[1].streamTime(frameShiftSeconds: 0.04), 0.20)
+
+        // Only an explicit session reset restarts the absolute clock.
+        decoder.reset()
+        streamClock.reset()
+        var afterExplicitReset: [KeywordDetection] = []
+        for shouldEmitToken in [true, false] {
+            emitToken = shouldEmitToken
+            afterExplicitReset.append(contentsOf: streamClock.stamp(
+                decoder.step(encoderFrame: [Float](repeating: 0, count: 8))
+            ))
+        }
+        XCTAssertEqual(afterExplicitReset.first?.streamFrameIndex, 1)
+        XCTAssertEqual(afterExplicitReset.first?.streamTimestamps, [0])
     }
 }
 
@@ -539,6 +795,24 @@ final class E2ESpeechWakeWordTests: XCTestCase {
         XCTAssertFalse(detections.contains(where: { $0.phrase == "LOVELY CHILD" }))
     }
 
+    func testCustomSearchOptionsDetectLightUp() throws {
+        let d = try detector
+        let url = try XCTUnwrap(Bundle.module.url(
+            forResource: "kws_light_up", withExtension: "wav"
+        ))
+        let audio = try AudioFileLoader.load(url: url, targetSampleRate: 16_000)
+        let detections = try d.detect(
+            audio: audio,
+            sampleRate: 16_000,
+            options: WakeWordDecodingOptions(
+                beam: 8,
+                numTrailingBlanks: 3,
+                autoResetSeconds: 10
+            )
+        )
+        XCTAssertTrue(detections.contains { $0.phrase == "LIGHT UP" })
+    }
+
     func testDetectsLovelyChildOrForEver() throws {
         // 1.wav contains both "LOVELY CHILD" and "FOR EVER". The Python
         // reference only asserts one phrase per clip — mirror that here,
@@ -558,18 +832,42 @@ final class E2ESpeechWakeWordTests: XCTestCase {
         let url = try XCTUnwrap(Bundle.module.url(forResource: "kws_light_up", withExtension: "wav"))
         let audio = try AudioFileLoader.load(url: url, targetSampleRate: 16000)
         let session = try d.createSession()
-        var streamed: [String] = []
+        var streamed: [KeywordDetection] = []
         let chunkSize = 16000 / 4
         var offset = 0
         while offset < audio.count {
             let end = min(offset + chunkSize, audio.count)
             let dets = try session.pushAudio(Array(audio[offset..<end]))
-            streamed.append(contentsOf: dets.map { $0.phrase })
+            streamed.append(contentsOf: dets)
             offset = end
         }
-        streamed.append(contentsOf: try session.finalize().map { $0.phrase })
-        XCTAssertTrue(streamed.contains("LIGHT UP"),
-                      "streaming missed 'LIGHT UP' — saw \(streamed)")
+        streamed.append(contentsOf: try session.finalize())
+        XCTAssertTrue(streamed.contains { $0.phrase == "LIGHT UP" },
+                      "streaming missed 'LIGHT UP' — saw \(streamed.map(\.phrase))")
+        XCTAssertTrue(streamed.allSatisfy { $0.streamFrameIndex != nil })
+        XCTAssertTrue(streamed.allSatisfy {
+            $0.streamTimestamps?.count == $0.timestamps.count
+        })
+    }
+
+    func testStreamingResetAfterEncoderPredictionRestartsFromWritableState() throws {
+        let d = try detector
+        let url = try XCTUnwrap(Bundle.module.url(
+            forResource: "kws_light_up", withExtension: "wav"
+        ))
+        let audio = try AudioFileLoader.load(url: url, targetSampleRate: 16_000)
+        let session = try d.createSession()
+
+        // An encoder prediction replaces the initially writable state arrays
+        // with Core ML-owned outputs. Some backends expose those outputs as
+        // read-only memory, so reset must allocate new state rather than
+        // zeroing the prediction buffers in place.
+        _ = try session.pushAudio(audio)
+        try session.reset()
+        var detections = try session.pushAudio(audio)
+        detections.append(contentsOf: try session.finalize())
+
+        XCTAssertTrue(detections.contains { $0.phrase == "LIGHT UP" })
     }
 
     func testStreamingRealTimeFactor() throws {

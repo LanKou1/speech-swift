@@ -33,6 +33,18 @@ public struct WakeCommand: ParsableCommand {
     @Flag(name: .long, help: "Output as JSON")
     public var json: Bool = false
 
+    @Option(name: .long, help: "Number of active transducer hypotheses")
+    public var beam: Int = 4
+
+    @Option(name: .long, help: "Blank frames required after a matched keyword")
+    public var trailingBlanks: Int?
+
+    @Option(name: .long, help: "Seconds without a keyword emission before resetting search")
+    public var autoResetSeconds: Double?
+
+    @Option(name: .long, help: "Penalty subtracted from the blank-token logit")
+    public var blankPenalty: Float = 0
+
     public init() {}
 
     public func run() throws {
@@ -57,7 +69,17 @@ public struct WakeCommand: ParsableCommand {
 
             print("Detecting keywords for: \(specs.map { $0.phrase }.joined(separator: ", "))")
             let start = Date()
-            let detections = try detector.detect(audio: audio, sampleRate: 16000)
+            let options = WakeWordDecodingOptions(
+                beam: beam,
+                numTrailingBlanks: trailingBlanks,
+                blankPenalty: blankPenalty,
+                autoResetSeconds: autoResetSeconds
+            )
+            let detections = try detector.detect(
+                audio: audio,
+                sampleRate: 16000,
+                options: options
+            )
             let elapsed = Date().timeIntervalSince(start)
 
             if json {
@@ -66,7 +88,9 @@ public struct WakeCommand: ParsableCommand {
                 print("No keywords detected.")
             } else {
                 for d in detections {
-                    let t = String(format: "%.2f", d.time(frameShiftSeconds: 0.04))
+                    let time = d.streamTime(frameShiftSeconds: 0.04)
+                        ?? d.time(frameShiftSeconds: 0.04)
+                    let t = String(format: "%.2f", time)
                     print("[\(t)s] \(d.phrase)")
                 }
                 print("\n\(detections.count) detection(s)")
@@ -129,11 +153,17 @@ public struct WakeCommand: ParsableCommand {
     private func printJSON(_ detections: [KeywordDetection]) {
         var items = [[String: Any]]()
         for d in detections {
+            let streamFrame = d.streamFrameIndex ?? d.frameIndex
+            let streamTime = d.streamTime(frameShiftSeconds: 0.04)
+                ?? d.time(frameShiftSeconds: 0.04)
             items.append([
                 "phrase": d.phrase,
-                "frame": d.frameIndex,
-                "time": Double(String(format: "%.3f", d.time(frameShiftSeconds: 0.04)))!,
-                "tokens": d.tokenIds
+                "frame": streamFrame,
+                "time": Double(String(format: "%.3f", streamTime))!,
+                "tokens": d.tokenIds,
+                "tokenFrames": d.streamTimestamps ?? d.timestamps,
+                "decoderFrame": d.frameIndex,
+                "decoderTokenFrames": d.timestamps
             ])
         }
         if let data = try? JSONSerialization.data(withJSONObject: items, options: .prettyPrinted),

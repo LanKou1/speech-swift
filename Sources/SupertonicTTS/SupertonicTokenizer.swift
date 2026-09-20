@@ -151,63 +151,127 @@ public struct SupertonicTokenizer: Sendable {
 
     // MARK: - chunking
 
+    /// Token count of the wrapped, preprocessed form of `text` — what `process()` emits before
+    /// padding. Past `textLength`, `process()` truncates silently; NFKD adds a scalar per accented
+    /// letter, so a raw-scalar budget alone cannot guarantee the fit.
+    func wrappedLength(_ text: String, lang: String) throws -> Int {
+        try preprocess(text, lang: lang).unicodeScalars.count
+    }
+
+    /// Smallest piece the balanced splitter may produce (scalars); also the packing-budget floor.
+    static let minPieceScalars = 8
+
     /// Split free-form text into per-synthesis chunks that fit the fixed text length after the
-    /// `<lang>` wrap. CoreML latent length L is dynamic (RangeDim), so only the text axis bounds us.
+    /// `<lang>` wrap. CoreML latent length L is dynamic (RangeDim), so only the text axis bounds
+    /// us. Mirrors `helper.py::_chunk_text` and the C++ `SupertonicTokenizer::chunk()`: sentences
+    /// (terminal punctuation followed by whitespace) are packed greedily up to a raw-scalar
+    /// budget; a longer sentence is bisected at its best boundary in balanced halves rather than
+    /// word-packed at the budget (which strands its last word or two in a tiny chunk — speech-core
+    /// #140). Every chunk is guaranteed to fit `textLength` after NFKD (`wrappedLength`).
     func chunk(_ text: String, lang: String, textLength: Int) -> [String] {
-        var cap = textLength - (2 * lang.count + 5) - 1
-        if cap < 8 { cap = 8 }
+        var budget = textLength - (2 * lang.count + 5) - 1
+        if budget < Self.minPieceScalars { budget = Self.minPieceScalars }
 
         let cps = Array(text.unicodeScalars)
-        let term: Set<UInt32> = [0x2E, 0x21, 0x3F, 0x2026, 0x3002, 0xFF01, 0xFF1F]
-        func isWs(_ s: Unicode.Scalar) -> Bool { s == " " || s == "\n" || s == "\t" || s == "\r" }
 
-        // sentence-ish split at terminal punctuation + following whitespace.
+        // sentence-ish split at terminal punctuation + following whitespace; trim each sentence.
         var sentences: [[Unicode.Scalar]] = []
         var cur: [Unicode.Scalar] = []
+        func pushSentence() {
+            var a = 0, b = cur.count
+            while a < b, Self.isWs(cur[a]) { a += 1 }
+            while b > a, Self.isWs(cur[b - 1]) { b -= 1 }
+            if b > a { sentences.append(Array(cur[a..<b])) }
+            cur.removeAll(keepingCapacity: true)
+        }
         for (i, s) in cps.enumerated() {
             cur.append(s)
-            if term.contains(s.value), i + 1 < cps.count, isWs(cps[i + 1]) {
-                sentences.append(cur); cur = []
+            if Self.sentenceEnd.contains(s.value), i + 1 < cps.count, Self.isWs(cps[i + 1]) {
+                pushSentence()
             }
         }
-        if !cur.isEmpty { sentences.append(cur) }
+        pushSentence()
 
         var out: [String] = []
         var chunk: [Unicode.Scalar] = []
         func flush() {
-            var a = 0, b = chunk.count
-            while a < b, chunk[a] == " " { a += 1 }
-            while b > a, chunk[b - 1] == " " { b -= 1 }
-            if b > a { out.append(String(String.UnicodeScalarView(chunk[a..<b]))) }
+            if !chunk.isEmpty {
+                emitWithinCapacity(String(String.UnicodeScalarView(chunk)), lang: lang,
+                                   textLength: textLength, into: &out)
+            }
             chunk.removeAll(keepingCapacity: true)
         }
-        func fits(_ n: Int) -> Bool { chunk.count + (chunk.isEmpty ? 0 : 1) + n <= cap }
-        func appendUnit(_ u: ArraySlice<Unicode.Scalar>) {
-            if !chunk.isEmpty { chunk.append(" ") }
-            chunk.append(contentsOf: u)
-        }
+        func fits(_ n: Int) -> Bool { chunk.count + (chunk.isEmpty ? 0 : 1) + n <= budget }
 
         for sent in sentences {
-            if sent.count <= cap {
+            if sent.count <= budget {
                 if !fits(sent.count) { flush() }
-                appendUnit(sent[...])
+                if !chunk.isEmpty { chunk.append(" ") }
+                chunk.append(contentsOf: sent)
                 continue
             }
-            flush()  // oversize sentence: hard-split on words
-            var word: [Unicode.Scalar] = []
-            func pushWord() {
-                if word.isEmpty { return }
-                if !fits(word.count) { flush() }
-                appendUnit(word[...]); word.removeAll(keepingCapacity: true)
-            }
-            for s in sent {
-                if isWs(s) { pushWord(); continue }
-                word.append(s)
-                if word.count >= cap { pushWord() }
-            }
-            pushWord()
+            // Longer than the packing budget: keep it in one piece where the capacity allows,
+            // otherwise cut it in balanced halves at the best boundary — never at the budget.
+            flush()
+            emitWithinCapacity(String(String.UnicodeScalarView(sent)), lang: lang,
+                               textLength: textLength, into: &out)
         }
         flush()
         return out.isEmpty ? [""] : out
+    }
+
+    /// Append `text` as one chunk when its wrapped form fits `textLength`; otherwise bisect at the
+    /// best sentence/clause/word boundary until every piece fits.
+    private func emitWithinCapacity(_ text: String, lang: String, textLength: Int,
+                                    into out: inout [String]) {
+        // An unsupported language throws in process() anyway; treat it as fitting here.
+        let wrapped = (try? wrappedLength(text, lang: lang)) ?? 0
+        if wrapped <= textLength { out.append(text); return }
+        guard let (left, right) = Self.bisect(text, minScalars: Self.minPieceScalars) else {
+            out.append(text)  // nothing to cut on; process() truncates this one
+            return
+        }
+        emitWithinCapacity(left, lang: lang, textLength: textLength, into: &out)
+        emitWithinCapacity(right, lang: lang, textLength: textLength, into: &out)
+    }
+
+    static let sentenceEnd: Set<UInt32> = [0x2E, 0x21, 0x3F, 0x2026, 0x3002, 0xFF01, 0xFF1F]
+    static let clauseEnd: Set<UInt32> = [0x2C, 0x3B, 0x3A]  // , ; :
+
+    @inline(__always)
+    static func isWs(_ s: Unicode.Scalar) -> Bool {
+        s == " " || s == "\n" || s == "\t" || s == "\r" || s.value == 0x0B || s.value == 0x0C
+    }
+
+    /// Split `text` in two at the best boundary — sentence end > clause end (`,;:`) > whitespace >
+    /// any scalar — and, within a class, the most balanced cut. Both halves are trimmed. Returns
+    /// nil when no cut leaves both halves at least `minScalars` long.
+    static func bisect(_ text: String, minScalars: Int) -> (String, String)? {
+        let s = Array(text.unicodeScalars)
+        let n = s.count
+        guard minScalars > 0, n >= 2 * minScalars else { return nil }
+        var best: (rank: Int, largest: Int, imbalance: Int, l: Int, r: Int)?
+        for cut in minScalars...(n - minScalars) {
+            var l = cut, r = cut
+            while l > 0, isWs(s[l - 1]) { l -= 1 }
+            while r < n, isWs(s[r]) { r += 1 }
+            let leftCount = l, rightCount = n - r
+            if leftCount < minScalars || rightCount < minScalars { continue }
+            let before = s[l - 1].value, after = s[r].value
+            var rank = 3
+            if sentenceEnd.contains(before) || clauseEnd.contains(before) {
+                // never split inside a punctuation run
+                if sentenceEnd.contains(after) || clauseEnd.contains(after) { continue }
+                rank = sentenceEnd.contains(before) ? 0 : 1
+            } else if r > l {
+                rank = 2
+            }
+            let largest = max(leftCount, rightCount)
+            let imbalance = abs(leftCount - rightCount)
+            if let b = best, (b.rank, b.largest, b.imbalance) <= (rank, largest, imbalance) { continue }
+            best = (rank, largest, imbalance, l, r)
+        }
+        guard let b = best else { return nil }
+        return (String(String.UnicodeScalarView(s[0..<b.l])), String(String.UnicodeScalarView(s[b.r..<n])))
     }
 }

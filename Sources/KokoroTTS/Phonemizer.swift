@@ -94,6 +94,37 @@ public final class KokoroPhonemizer {
         }
     }
 
+    /// Injects custom `word -> IPA` pronunciations into the gold dictionary.
+    ///
+    /// `resolveWord` consults `goldDict` before the silver dict, stemming, and the
+    /// neural `bartG2P` fallback, so entries added here take precedence over all
+    /// three. Proper nouns absent from the shipped dictionaries are otherwise
+    /// guessed from *English* spelling rules and come out badly wrong for
+    /// non-Anglo names. The function words in `specialCase` — the, a, an, to, of,
+    /// i — resolve earlier still and cannot be overridden this way.
+    ///
+    /// Keys are matched lowercased and must be single words: text is split on
+    /// whitespace and punctuation before resolution, so a key containing a space,
+    /// hyphen, or apostrophe is never looked up. Register the parts separately.
+    ///
+    /// IPA must use symbols present in the model vocabulary — unknown characters
+    /// are silently dropped by `tokenize`.
+    ///
+    /// English only. `tokenize` routes zh, ja, it, fr, es, pt, and hi to their
+    /// own phonemizers, none of which consult `goldDict`, so entries added here
+    /// are a no-op for those languages.
+    ///
+    /// Not synchronized: `tokenize` reads `goldDict` without a lock, so register
+    /// entries before synthesis starts running concurrently.
+    ///
+    /// Call this after `loadDictionaries(from:)`, which replaces the gold
+    /// dictionary wholesale and would discard entries added before it.
+    public func addPronunciations(_ entries: [String: String]) {
+        for (word, ipa) in entries {
+            goldDict[word.lowercased()] = .simple(ipa)
+        }
+    }
+
     /// Load separate G2P encoder + decoder CoreML models.
     public func loadG2PModels(encoderURL: URL, decoderURL: URL, vocabURL: URL) throws {
         let config = MLModelConfiguration()

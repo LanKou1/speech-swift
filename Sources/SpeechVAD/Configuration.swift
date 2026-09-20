@@ -90,3 +90,27 @@ public struct VADConfig: Sendable {
         stepRatio: 1.0
     )
 }
+
+/// Settings for an optional end-of-turn classifier layered on the VAD hysteresis.
+///
+/// When a `TurnCompletionProvider` is attached to `StreamingVADProcessor`, a
+/// confirmed silence only ends the segment once the classifier's completion
+/// probability reaches `threshold`. Below it the processor keeps the segment
+/// open: the user speaking again continues the same segment, and
+/// `maxSilenceDuration` of continued silence ends it regardless.
+public struct TurnCompletionConfig: Sendable {
+    /// Completion probability at or above which a pause ends the turn.
+    public var threshold: Float
+    /// Seconds of silence (from the pause start) after which a vetoed turn ends anyway.
+    public var maxSilenceDuration: Float
+    /// Seconds of audio before the VAD onset that are included in the classifier input.
+    public var preRollDuration: Float
+
+    public init(threshold: Float = 0.5, maxSilenceDuration: Float = 2.0, preRollDuration: Float = 0.5) {
+        self.threshold = threshold
+        self.maxSilenceDuration = maxSilenceDuration
+        self.preRollDuration = preRollDuration
+    }
+
+    public static let `default` = TurnCompletionConfig()
+}

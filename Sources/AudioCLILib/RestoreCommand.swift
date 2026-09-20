@@ -1,4 +1,5 @@
 import Foundation
+import CoreML
 import ArgumentParser
 import SpeechRestoration
 import AudioCommon
@@ -26,7 +27,28 @@ public struct RestoreCommand: ParsableCommand {
     @Option(name: .shortAndLong, help: "Model repo id on HuggingFace")
     public var model: String = SpeechRestorer.defaultModelId
 
+    @Option(
+        name: .long,
+        help: """
+        Core ML compute units for both stages: ane, gpu, cpu, or all. \
+        Default: predictor 'all', vocoder 'gpu' — the vocoder's Neural Engine \
+        compile takes minutes and can fail, so it stays on the GPU unless asked.
+        """)
+    public var computeUnits: String?
+
     public init() {}
+
+    public func validate() throws {
+        guard SidonVariant(rawValue: variant) != nil else {
+            throw ValidationError(
+                "Unknown variant '\(variant)'. Use one of: "
+                + SidonVariant.allCases.map { $0.rawValue }.joined(separator: ", "))
+        }
+        if let computeUnits, CoreMLComputeUnitsResolver.parse(computeUnits) == nil {
+            throw ValidationError(
+                "Unknown compute units '\(computeUnits)'. Use one of: ane, gpu, cpu, all")
+        }
+    }
 
     public func run() throws {
         try runAsync {
@@ -35,6 +57,8 @@ public struct RestoreCommand: ParsableCommand {
                     "Unknown variant '\(variant)'. Use one of: "
                     + SidonVariant.allCases.map { $0.rawValue }.joined(separator: ", "))
             }
+            // Uniform override for both stages; nil keeps the per-stage defaults.
+            let uniformUnits = computeUnits.flatMap { CoreMLComputeUnitsResolver.parse($0) }
 
             let inputURL = URL(fileURLWithPath: audioFile)
             print("Loading audio: \(audioFile)")
@@ -44,10 +68,20 @@ public struct RestoreCommand: ParsableCommand {
             let durIn = Double(audio.count) / Double(SpeechRestorer.inputSampleRate)
             print("  Loaded \(audio.count) samples (\(String(format: "%.2f", durIn))s @ 16 kHz)")
 
-            print("Loading Sidon (\(variant))…")
+            // Report what each stage will actually load with, including the
+            // SPEECH_COREML_COMPUTE_UNITS env override the loader applies.
+            let placement = SidonComputePlacement.resolve(
+                computeUnits: uniformUnits, predictor: nil, vocoder: nil)
+            let predictorUnits = CoreMLComputeUnitsResolver.resolved(default: placement.predictor)
+            let vocoderUnits = CoreMLComputeUnitsResolver.resolved(default: placement.vocoder)
+            print(
+                "Loading Sidon (\(variant); predictor: "
+                + "\(CoreMLComputeUnitsResolver.shortName(predictorUnits)), vocoder: "
+                + "\(CoreMLComputeUnitsResolver.shortName(vocoderUnits)))…")
             let restorer = try await SpeechRestorer.fromPretrained(
                 variant: variantEnum,
                 modelId: model,
+                computeUnits: uniformUnits,
                 progressHandler: { reportProgress($0, $1) })
 
             print("Restoring (10 s windows)…")

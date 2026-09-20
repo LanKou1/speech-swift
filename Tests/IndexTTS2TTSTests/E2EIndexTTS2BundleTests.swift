@@ -2,6 +2,7 @@ import AudioCommon
 import Darwin
 import Foundation
 @testable import IndexTTS2TTS
+import MLX
 @testable import Qwen3ASR
 import XCTest
 
@@ -202,15 +203,26 @@ final class E2EIndexTTS2BundleTests: XCTestCase {
         let asrModelId = env["INDEXTTS2_E2E_ASR_MODEL"] ?? Self.defaultQwenASRModelId
         let asr = try await Qwen3ASRModel.fromPretrained(modelId: asrModelId)
         let asrStart = CFAbsoluteTimeGetCurrent()
-        let transcript = asr.transcribe(audio: audio, sampleRate: model.sampleRate, language: "english")
+        let language = env["INDEXTTS2_E2E_LANGUAGE"] ?? "english"
+        let transcript = asr.transcribe(audio: audio, sampleRate: model.sampleRate, language: language)
         let asrSec = CFAbsoluteTimeGetCurrent() - asrStart
         let asrRTF = asrSec / max(audioSec, 1e-6)
-        let wer = Self.wordErrorRate(reference: text, hypothesis: transcript)
+        // ASR writes numbers as digits, so score both sides after the same
+        // number reading the synthesis used. CJK references carry no word
+        // boundaries; score them per character.
+        let scoredReference = IndexTTS2TextNormalizer.normalize(text)
+        let scoredHypothesis = IndexTTS2TextNormalizer.normalize(transcript)
+        let usesCharacters = text.unicodeScalars.contains(where: Self.isCJK)
+        let wer = usesCharacters
+            ? Self.characterErrorRate(reference: scoredReference, hypothesis: scoredHypothesis)
+            : Self.wordErrorRate(reference: scoredReference, hypothesis: scoredHypothesis)
         let maxWER = Double(env["INDEXTTS2_E2E_MAX_WER"] ?? "") ?? 0.25
 
         print(String(format:
-            "[IndexTTS2Roundtrip] asrModel=%@ transcript=\"%@\" wer=%.3f asrSec=%.3f asrRTF=%.3f maxWER=%.3f",
+            "[IndexTTS2Roundtrip] asrModel=%@ language=%@ metric=%@ transcript=\"%@\" wer=%.3f asrSec=%.3f asrRTF=%.3f maxWER=%.3f",
             asrModelId,
+            language,
+            usesCharacters ? "cer" : "wer",
             transcript,
             wer,
             asrSec,
@@ -219,6 +231,102 @@ final class E2EIndexTTS2BundleTests: XCTestCase {
 
         XCTAssertFalse(Self.normalizedWords(transcript).isEmpty, "ASR roundtrip transcript should not be empty")
         XCTAssertLessThanOrEqual(wer, maxWER, "ASR roundtrip WER exceeded threshold")
+    }
+
+    func testTokenizerMatchesUpstreamTokenIDs() async throws {
+        let tokenizer = try await loadTokenizer()
+
+        // Golden ids from the upstream text front end (`char_rep_map` +
+        // `tokenize_by_CJK_char`) and SentencePiece on the published `bpe.model`.
+        let cases: [(text: String, ids: [Int])] = [
+            ("你好世界", [10201, 208, 10201, 1260, 10201, 22, 10201, 3755]),
+            ("你好，这是一个中文合成测试。",
+             [10201, 208, 10201, 1260, 10202, 10201, 5935, 10201, 2474, 10201, 7, 10201, 34, 10201, 36,
+              10201, 2398, 10201, 680, 10201, 2043, 10201, 3110, 10201, 5551, 10203]),
+            ("你好世界是 hello world 的中文",
+             [10201, 208, 10201, 1260, 10201, 22, 10201, 3755, 10201, 2474, 11122, 10394, 10201, 3880,
+              10201, 36, 10201, 2398]),
+            ("你好！吗？", [10201, 208, 10201, 1260, 10201, 10481, 10201, 694, 10219]),
+            ("Hello \"world\" (ok): done.",
+             [11122, 10201, 10206, 10603, 10391, 10438, 10258, 10206, 10201, 10206, 11412, 10206,
+              10209, 10467, 10216]),
+            ("你好🙂", [10201, 208, 10201, 1260, 10201, 2]),
+            ("A2024B", [10210, 10270, 10456, 10380, 10361, 10462]),
+            ("今天是2024年",
+             [10201, 124, 10201, 1221, 10201, 2474, 10201, 83, 10201, 6500, 10201, 83, 10201, 1017, 10201, 1698]),
+            ("今天是2024年3月5日，温度是25.5度。",
+             [10201, 124, 10201, 1221, 10201, 2474, 10201, 83, 10201, 6500, 10201, 83, 10201, 1017, 10201, 1698,
+              10201, 12, 10201, 2544, 10201, 90, 10201, 2437, 10202, 10201, 3210, 10201, 1726, 10201, 2474,
+              10201, 83, 10201, 570, 10201, 90, 10201, 3393, 10201, 90, 10201, 1726, 10203]),
+            ("The meeting is at 10:30 on the 21st.",
+             [10204, 11762, 10218, 10244, 10472, 10561, 10226, 10204, 10380, 10315, 10216]),
+            ("It costs $3.50, about 50% off.",
+             [10215, 10985, 10208, 10321, 10681, 10601, 10201, 10336, 11394, 10208, 10209, 10251, 10601, 10532,
+              10375, 10216]),
+        ]
+        for (text, ids) in cases {
+            XCTAssertEqual(try tokenizer.encode(text), ids, "token ids for \(text)")
+        }
+    }
+
+    private func loadTokenizer() async throws -> IndexTTS2Tokenizer {
+        let env = ProcessInfo.processInfo.environment
+        if let path = env["INDEXTTS2_E2E_BPE_MODEL"], !path.isEmpty {
+            let url = URL(fileURLWithPath: path)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw XCTSkip("INDEXTTS2_E2E_BPE_MODEL not found at \(url.path)")
+            }
+            return try IndexTTS2Tokenizer(modelURL: url)
+        }
+        let model = try await loadModel()
+        return try XCTUnwrap(model.tokenizer, "bundle tokenizer failed to initialize")
+    }
+
+    private static let defaultLongText =
+        "The quick brown fox jumps over the lazy dog near the river bank. "
+        + "Every morning the baker opens the shop before sunrise and sets out fresh bread. "
+        + "Later in the day the children walk home from school along the same road. "
+        + "By evening the whole street smells of coffee and rain."
+
+    func testLongTextSynthesisSplitsIntoSegments() async throws {
+        let model = try await loadModel()
+        let env = ProcessInfo.processInfo.environment
+        let referenceURL = try benchmarkReferenceURL(env: env)
+        let text = env["INDEXTTS2_E2E_LONG_TEXT"] ?? Self.defaultLongText
+        let options = try IndexTTS2SynthesisOptions(
+            maxInternalPauseDuration: Float(env["INDEXTTS2_E2E_MAX_PAUSE"] ?? ""),
+            maxTextTokensPerSegment: Int(env["INDEXTTS2_E2E_SEGMENT_TOKENS"] ?? "") ?? 30)
+        let tokenizer = try XCTUnwrap(model.tokenizer)
+        let segments = IndexTTS2TextSegmenter.split(
+            try tokenizer.tokenize(text), maxTokens: options.maxTextTokensPerSegment)
+        XCTAssertGreaterThanOrEqual(segments.count, 3, "long text should split into several segments")
+
+        _ = try model.prepareRuntime()
+        let conditioning = try model.prepareReferenceConditioning(referenceAudio: referenceURL)
+        let start = CFAbsoluteTimeGetCurrent()
+        let audio = try model.synthesize(text: text, conditioning: conditioning, synthesisOptions: options)
+        let synthesisSec = CFAbsoluteTimeGetCurrent() - start
+        let audioSec = Double(audio.count) / Double(model.sampleRate)
+        XCTAssertGreaterThan(audioSec, 8)
+        XCTAssertTrue(audio.allSatisfy(\.isFinite))
+        if let output = env["INDEXTTS2_E2E_OUTPUT"], !output.isEmpty {
+            try WAVWriter.write(samples: audio, sampleRate: model.sampleRate, to: URL(fileURLWithPath: output))
+        }
+        print(String(format: "[IndexTTS2LongText] segments=%d audioSec=%.2f synthesisSec=%.1f rtf=%.2f",
+                     segments.count, audioSec, synthesisSec, synthesisSec / max(audioSec, 1e-6)))
+
+        guard env["INDEXTTS2_E2E_ROUNDTRIP"] == "1" else { return }
+        Memory.clearCache()
+        let asr = try await Qwen3ASRModel.fromPretrained(
+            modelId: env["INDEXTTS2_E2E_ASR_MODEL"] ?? Self.defaultQwenASRModelId)
+        let language = env["INDEXTTS2_E2E_LANGUAGE"] ?? "english"
+        let transcript = asr.transcribe(audio: audio, sampleRate: model.sampleRate, language: language)
+        let usesCharacters = text.unicodeScalars.contains(where: Self.isCJK)
+        let wer = usesCharacters
+            ? Self.characterErrorRate(reference: text, hypothesis: transcript)
+            : Self.wordErrorRate(reference: text, hypothesis: transcript)
+        print(String(format: "[IndexTTS2LongTextRoundtrip] transcript=\"%@\" wer=%.3f", transcript, wer))
+        XCTAssertLessThanOrEqual(wer, Double(env["INDEXTTS2_E2E_MAX_WER"] ?? "") ?? 0.25)
     }
 
     private func loadModel() async throws -> IndexTTS2TTSModel {
@@ -380,8 +488,14 @@ final class E2EIndexTTS2BundleTests: XCTestCase {
     }
 
     private static func wordErrorRate(reference: String, hypothesis: String) -> Double {
-        let ref = normalizedWords(reference)
-        let hyp = normalizedWords(hypothesis)
+        editRate(reference: normalizedWords(reference), hypothesis: normalizedWords(hypothesis))
+    }
+
+    private static func characterErrorRate(reference: String, hypothesis: String) -> Double {
+        editRate(reference: normalizedCharacters(reference), hypothesis: normalizedCharacters(hypothesis))
+    }
+
+    private static func editRate(reference ref: [String], hypothesis hyp: [String]) -> Double {
         guard !ref.isEmpty else { return hyp.isEmpty ? 0 : 1 }
 
         var previous = Array(0...hyp.count)
@@ -396,6 +510,16 @@ final class E2EIndexTTS2BundleTests: XCTestCase {
             previous = current
         }
         return Double(previous[hyp.count]) / Double(ref.count)
+    }
+
+    private static func normalizedCharacters(_ text: String) -> [String] {
+        normalizedWords(text).flatMap { $0.map(String.init) }
+    }
+
+    private static func isCJK(_ scalar: Unicode.Scalar) -> Bool {
+        (0x2E80...0x9FFF).contains(scalar.value)
+            || (0xF900...0xFAFF).contains(scalar.value)
+            || (0x20000...0x2FFFF).contains(scalar.value)
     }
 
     private static func normalizedWords(_ text: String) -> [String] {

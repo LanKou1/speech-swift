@@ -25,13 +25,18 @@ while t < encoded_length:
     if token == blank:
         t += 1
     else:
-        emit(token)
+        if vocabulary.is_text_token(token):
+            emit(token)
         duration = duration_bins[argmax(dur_logits)]
         t += max(duration, 1)
         decoder_state = lstm(token, decoder_state)
 ```
 
-This variable-rate alignment is more accurate and efficient than fixed-rate RNN-T.
+Transcript filtering is derived from the vocabulary: angle-bracket control tokens are hidden,
+while ordinary text tokens are emitted regardless of their numeric ID. This preserves the digit
+tokens `0`–`9` at IDs 234–243. Every non-blank token still updates the prediction-network state,
+including hidden control tokens. This variable-rate alignment is more accurate and efficient than
+fixed-rate RNN-T.
 
 ## CoreML Models
 

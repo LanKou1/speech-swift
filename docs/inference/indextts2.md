@@ -37,6 +37,23 @@ For identity-first cloning, omit explicit emotion control and use
 `IndexTTS2SynthesisOptions` for tempo and pause shaping. High emotion weights can
 reduce speaker similarity.
 
+Long text is synthesized segment by segment, as upstream does: the token
+sequence is cut after sentence-final punctuation (then commas and hyphens,
+then by length), neighbouring runs are merged back up to
+`maxTextTokensPerSegment` (default 120), each segment is generated on its own,
+and the pieces are joined with `segmentIntervalSilence` (default 0.2 s, capped
+by `maxInternalPauseDuration` when set). `generate(text:referenceAudio:…)` and
+`synthesize(text:conditioning:semanticOptions:synthesisOptions:)` take this
+path; the semantic-code entry points still generate one sequence.
+
+The tokenizer mirrors the upstream text front end: CJK punctuation is rewritten
+(`。` → `.`), every CJK character gets its own word boundary, and Latin text is
+uppercased, so Mandarin and mixed Chinese/English input work as-is. Numbers
+are read out before tokenization (`2024年3月5日` → `二零二四年三月五日`,
+`at 10:30 on the 21st` → `at ten thirty on the twenty first`), covering
+cardinals, years, dates, times, decimals, percentages, fractions, money,
+ordinals and negatives; anything beyond that should be written as words.
+
 ## CLI
 
 Use a local exported bundle:
@@ -124,4 +141,13 @@ Useful diagnostic overrides are `INDEXTTS2_E2E_SEED`,
 `INDEXTTS2_E2E_EMOTION`, `INDEXTTS2_E2E_EMOTION_WEIGHT`,
 `INDEXTTS2_E2E_SPEAKING_RATE`, `INDEXTTS2_E2E_MAX_PAUSE`,
 `INDEXTTS2_E2E_SEMANTIC_CODES`, `INDEXTTS2_E2E_SEMANTIC_ONLY=1`, and
-`INDEXTTS2_E2E_SEED_SWEEP=0-20`.
+`INDEXTTS2_E2E_SEED_SWEEP=0-20`. `INDEXTTS2_E2E_LANGUAGE=zh` with a Mandarin
+`INDEXTTS2_E2E_TEXT` runs the round trip in Chinese; CJK references are scored
+by character error rate instead of WER.
+
+`testTokenizerMatchesUpstreamTokenIDs` pins the native tokenizer to golden
+token ids from the upstream text front end (`char_rep_map` +
+`tokenize_by_CJK_char` + SentencePiece) for Mandarin, mixed-script,
+punctuation, and unknown-scalar inputs. It only needs `bpe.model`, so
+`INDEXTTS2_E2E_BPE_MODEL=/path/to/bpe.model` runs it without loading the
+full bundle.

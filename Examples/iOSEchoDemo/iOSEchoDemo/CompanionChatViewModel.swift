@@ -89,6 +89,9 @@ final class CompanionChatViewModel {
     // MARK: - Private State
 
     private var vadModel: SileroVADModel?
+    /// End-of-turn classifier (Smart Turn v3.2). Optional: when it fails to
+    /// load, the pipeline ends turns on VAD silence alone as before.
+    private var smartTurnModel: SmartTurnModel?
     private var sttModel: ParakeetASRModel?
     private var ttsModel: (any SpeechGenerationModel)?
     private var pipeline: VoicePipeline?
@@ -144,6 +147,20 @@ final class CompanionChatViewModel {
                     }
                 }
             }.value
+
+            // Smart Turn confirms each VAD pause so a mid-sentence pause does
+            // not end the turn. ~17 MB; non-fatal if unavailable.
+            loadingStatus = "Loading Smart Turn..."
+            do {
+                smartTurnModel = try await Task.detached {
+                    let model = try await SmartTurnModel.fromPretrained()
+                    try model.prewarm()
+                    return model
+                }.value
+            } catch {
+                smartTurnModel = nil
+                pipelineLog.warning("[LOAD] Smart Turn unavailable, turns end on VAD silence: \(error.localizedDescription, privacy: .public)")
+            }
 
             // Pre-download and compile STT model (~500MB).
             // Without this, the first speech triggers a download that blocks
@@ -239,7 +256,16 @@ final class CompanionChatViewModel {
             }
         )
 
-        pipelineLog.warning("[START] echo pipeline created")
+        // Attach the end-of-turn classifier before start(): a VAD pause then
+        // only ends the turn once Smart Turn's probability reaches
+        // config.turnCompletionThreshold; below it the pipeline keeps
+        // listening until speech resumes or turnCompletionMaxSilence elapses.
+        // The 5 s force-cut above bypasses the classifier.
+        if let smartTurnModel {
+            pipeline?.setTurnCompletion(smartTurnModel)
+        }
+
+        pipelineLog.warning("[START] echo pipeline created (smart turn: \(self.smartTurnModel != nil))")
 
         pipeline?.start()
         isListening = true

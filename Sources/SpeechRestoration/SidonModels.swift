@@ -9,7 +9,10 @@ import AudioCommon
 final class SidonPredictorModel {
     private let model: MLModel
 
-    init(modelURL: URL, computeUnits: MLComputeUnits = .all) throws {
+    init(
+        modelURL: URL,
+        computeUnits: MLComputeUnits = SidonComputePlacement.defaultPredictor
+    ) throws {
         let config = MLModelConfiguration()
         config.computeUnits = computeUnits
         self.model = try CoreMLLoader.load(
@@ -35,10 +38,18 @@ final class SidonPredictorModel {
 /// `features[1, T, 1024]` → `audio[1, M]` at 48 kHz. The `transpose(1,2)` that
 /// the upstream pipeline applies before the decoder is baked into the exported
 /// graph, so the runtime feeds `features` as-is.
+///
+/// Defaults to the GPU: the decoder's last stages are convolutions over
+/// ~480k-sample-wide tensors, and letting Core ML try the Neural Engine
+/// (`.all` / `.cpuAndNeuralEngine`) costs minutes of ANE compile that can also
+/// fail. See `SidonComputePlacement` for the measurements.
 final class SidonVocoderModel {
     private let model: MLModel
 
-    init(modelURL: URL, computeUnits: MLComputeUnits = .all) throws {
+    init(
+        modelURL: URL,
+        computeUnits: MLComputeUnits = SidonComputePlacement.defaultVocoder
+    ) throws {
         let config = MLModelConfiguration()
         config.computeUnits = computeUnits
         self.model = try CoreMLLoader.load(

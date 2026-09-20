@@ -62,4 +62,63 @@ final class SupertonicTokenizerTests: XCTestCase {
             XCTAssertLessThanOrEqual(c.unicodeScalars.count + 2 * 2 + 5, 128 + 1)
         }
     }
+
+    func testNFKDGrowthRespectsTextCapacity() throws {
+        let t = identityTokenizer()
+        // 19 × "élève": 114 raw scalars — under the 118 raw-scalar budget — but NFKD splits every
+        // accent off (é → e + U+0301), so the wrapped form is 161 tokens and process() used to
+        // drop the end of the sentence silently.
+        let s = (0..<19).map { _ in "élève" }.joined(separator: " ") + "."
+        XCTAssertLessThanOrEqual(s.unicodeScalars.count, 118)
+        XCTAssertGreaterThan(try t.wrappedLength(s, lang: "fr"), 128)
+
+        let chunks = t.chunk(s, lang: "fr", textLength: 128)
+        XCTAssertGreaterThanOrEqual(chunks.count, 2)
+        for c in chunks {
+            let wrapped = try t.wrappedLength(c, lang: "fr")
+            XCTAssertLessThanOrEqual(wrapped, 128)
+            let real = try t.process(c, lang: "fr", textLength: 128).mask.filter { $0 > 0 }.count
+            XCTAssertEqual(real, wrapped, "nothing may be truncated: \(c)")
+        }
+        XCTAssertEqual(chunks.joined(separator: " "), s, "nothing lost or reordered")
+    }
+
+    func testOversizeSentenceSplitsBalancedAtClauses() throws {
+        let t = identityTokenizer()
+        // Six 43-scalar clauses = one 269-scalar sentence, far past the 128-token text length.
+        // It must be cut — but at commas, in balanced pieces, never leaving a stub.
+        let clause = "the quick brown fox jumps over the lazy dog"
+        let s = (0..<6).map { _ in clause }.joined(separator: ", ") + "."
+        let chunks = t.chunk(s, lang: "en", textLength: 128)
+        XCTAssertGreaterThanOrEqual(chunks.count, 3)
+        for c in chunks {
+            XCTAssertLessThanOrEqual(try t.wrappedLength(c, lang: "en"), 128)
+            XCTAssertGreaterThanOrEqual(c.unicodeScalars.count, 40, "no stub pieces: \(c)")
+            XCTAssertTrue(c.hasSuffix(",") || c.hasSuffix("."), "cut at a clause boundary: \(c)")
+        }
+        XCTAssertEqual(chunks.joined(separator: " "), s)
+    }
+
+    func testSentencesPackUpToBudget() {
+        let t = identityTokenizer()
+        // helper.py parity: sentences share a chunk while len(cur) + 1 + len(s) <= budget (118).
+        let a = String(repeating: "a", count: 50) + "."
+        let b = String(repeating: "b", count: 50) + "."
+        XCTAssertEqual(t.chunk(a + " " + b, lang: "fr", textLength: 128), [a + " " + b])  // 103
+        let c = String(repeating: "c", count: 70) + "."
+        XCTAssertEqual(t.chunk(a + " " + c, lang: "fr", textLength: 128), [a, c])         // 123 > 118
+    }
+
+    func testBisectPrefersSentenceThenClauseThenWord() {
+        typealias T = SupertonicTokenizer
+        let two = T.bisect("Cet été, j'ai passé mes vacances à la campagne. J'ai loué une maison.", minScalars: 8)
+        XCTAssertEqual(two?.0, "Cet été, j'ai passé mes vacances à la campagne.")
+        XCTAssertEqual(two?.1, "J'ai loué une maison.")
+        let clause = T.bisect("Chaque matin, je me levais tôt pour faire une longue promenade.", minScalars: 8)
+        XCTAssertEqual(clause?.0, "Chaque matin,")
+        let word = T.bisect("J'ai aussi passé du temps à lire des livres sous les arbres.", minScalars: 8)
+        XCTAssertNotNil(word)
+        XCTAssertTrue(word!.0.unicodeScalars.count >= 20 && word!.1.unicodeScalars.count >= 20, "balanced: \(word!)")
+        XCTAssertNil(T.bisect("Bien sûr !", minScalars: 8), "too short to cut")
+    }
 }

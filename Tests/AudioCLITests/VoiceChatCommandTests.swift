@@ -945,9 +945,12 @@ final class VoiceChatCommandTests: XCTestCase {
             description: "Slow lookup",
             inputSchemaJSON: #"{"type":"object","properties":{}}"#,
             access: .read)
+        // The tool must stay in flight long enough for the status probe below
+        // to land inside its execution window even on a loaded CI runner,
+        // where a short `Task.sleep` can overshoot by well over 100 ms.
         let executor = DelayedVoiceChatMCPExecutor(
             tool: tool,
-            delayNanoseconds: 150_000_000)
+            delayNanoseconds: 1_000_000_000)
         let coordinator = VoiceChatMCPToolCoordinator(
             executor: executor,
             writePolicy: .confirm)
@@ -956,9 +959,17 @@ final class VoiceChatCommandTests: XCTestCase {
             await coordinator.handleFunctionCall(
                 #"[{"name":"lookup","arguments":{}}]"#)
         }
-        try await Task.sleep(nanoseconds: 30_000_000)
 
-        let runningStatus = await coordinator.runtimeStatus()
+        // Wait for the coordinator to report the call as executing instead of
+        // sleeping a fixed interval and hoping the call has started (and not
+        // yet finished) by then.
+        var runningStatus = await coordinator.runtimeStatus()
+        let deadline = DispatchTime.now().uptimeNanoseconds + 2_000_000_000
+        while !runningStatus.executing,
+              DispatchTime.now().uptimeNanoseconds < deadline {
+            try await Task.sleep(nanoseconds: 5_000_000)
+            runningStatus = await coordinator.runtimeStatus()
+        }
         XCTAssertTrue(runningStatus.executing)
         XCTAssertEqual(runningStatus.name, "lookup")
         let running = try XCTUnwrap(runningStatus.activity)
@@ -972,7 +983,7 @@ final class VoiceChatCommandTests: XCTestCase {
         XCTAssertNil(completedStatus.name)
         let completed = try XCTUnwrap(completedStatus.activity)
         XCTAssertEqual(completed.state, .completed)
-        XCTAssertGreaterThanOrEqual(completed.elapsedMilliseconds, 100)
+        XCTAssertGreaterThanOrEqual(completed.elapsedMilliseconds, 1000)
     }
 
     func testMCPRuntimeDiscoversAndCallsConfiguredStdioServer() async throws {

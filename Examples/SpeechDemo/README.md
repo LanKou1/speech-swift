@@ -53,13 +53,14 @@ The app has three tabs:
 
 ### Echo (Voice Pipeline)
 
-1. Click **Load Models** — downloads Silero VAD (CoreML), Parakeet TDT (CoreML), and Qwen3-TTS (MLX)
-2. Click **Start** to begin the voice pipeline
-3. Speak into the mic — the pipeline detects speech, transcribes it, and speaks it back
-4. Full-duplex: you can interrupt the agent while it's speaking (barge-in)
-5. Click **Stop** to end the session
+1. Click **Load Models** — downloads Silero VAD (CoreML), Smart Turn v3.2 (CoreML), Parakeet TDT (CoreML), and Qwen3-TTS (MLX)
+2. Leave **Smart Turn end-of-turn detection** on (default) to have each VAD pause confirmed by the end-of-turn classifier, so a mid-sentence pause does not trigger a reply; turn it off to end turns on silence alone
+3. Click **Start** to begin the voice pipeline
+4. Speak into the mic — the pipeline detects speech, transcribes it, and speaks it back. With Smart Turn on, every pause logs a `[Turn]` line with the completion probability and whether the turn was ended or held
+5. Full-duplex: you can interrupt the agent while it's speaking (barge-in)
+6. Click **Stop** to end the session
 
-The Echo tab uses the `SpeechCore` voice pipeline with AEC (acoustic echo cancellation) for full-duplex operation.
+The Echo tab uses the `SpeechCore` voice pipeline with AEC (acoustic echo cancellation) for full-duplex operation. Smart Turn is attached with `VoicePipeline.setTurnCompletion(_:)`; if its download fails the pipeline still runs and ends turns on VAD silence.
 
 ## Models downloaded on first run
 
@@ -70,3 +71,4 @@ The Echo tab uses the `SpeechCore` voice pipeline with AEC (acoustic echo cancel
 | Qwen3-TTS (MLX 4-bit) | ~1 GB | `~/Library/Caches/qwen3-speech/aufklarer_Qwen3-TTS-12Hz-0.6B-Base-MLX-4bit/` |
 | Qwen3-TTS Tokenizer | ~650 MB | `~/Library/Caches/qwen3-speech/Qwen_Qwen3-TTS-Tokenizer-12Hz/` |
 | Silero VAD v6.2.1 (CoreML) | ~1.2 MB | `~/Library/Caches/qwen3-speech/` |
+| Smart Turn v3.2 (CoreML) | ~17 MB | `~/Library/Caches/qwen3-speech/aufklarer_Smart-Turn-v3.2-CoreML/` |

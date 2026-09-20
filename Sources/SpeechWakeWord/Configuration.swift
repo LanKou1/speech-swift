@@ -125,3 +125,43 @@ public struct KeywordSpec: Sendable, Equatable {
         self.tokens = tokens
     }
 }
+
+/// Runtime search controls for one wake-word audio stream.
+///
+/// Model-owned defaults remain authoritative when an optional value is nil.
+/// Applications can widen the beam or allow a longer in-progress phrase
+/// without rebuilding or reloading the CoreML models.
+public struct WakeWordDecodingOptions: Sendable, Equatable {
+    /// Supported beam-width range for the shipped 500-piece transducer.
+    ///
+    /// Larger values multiply decoder/joiner calls without providing a
+    /// practical wake-word search benefit and can make a streaming session
+    /// fall behind real time.
+    public static let supportedBeamRange = 1...32
+
+    /// Longest supported interval before an incomplete search is reset.
+    public static let maximumAutoResetSeconds: Double = 3_600
+
+    /// Number of active transducer hypotheses retained after each frame.
+    public let beam: Int
+    /// Blank frames required after a complete keyword before it is emitted.
+    /// `nil` uses the model bundle's tuned default.
+    public let numTrailingBlanks: Int?
+    /// Logit penalty subtracted from the blank token.
+    public let blankPenalty: Float
+    /// Reset an incomplete search after this much audio without a keyword emission.
+    /// `nil` uses the model bundle's tuned default.
+    public let autoResetSeconds: Double?
+
+    public init(
+        beam: Int = 4,
+        numTrailingBlanks: Int? = nil,
+        blankPenalty: Float = 0,
+        autoResetSeconds: Double? = nil
+    ) {
+        self.beam = beam
+        self.numTrailingBlanks = numTrailingBlanks
+        self.blankPenalty = blankPenalty
+        self.autoResetSeconds = autoResetSeconds
+    }
+}

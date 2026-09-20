@@ -13,6 +13,7 @@ public class StreamingSession {
     private let vocabulary: NemotronVocabulary
     private let melPreprocessor: StreamingMelPreprocessor
     private let rnntDecoder: RNNTGreedyDecoder
+    private let language: String?
     private var wordBoostingState: WordBoostingState?
 
     private var cacheLastChannel: MLMultiArray
@@ -45,6 +46,7 @@ public class StreamingSession {
     init(
         config: NemotronStreamingConfig,
         languageSlot: Int,
+        language: String?,
         encoder: MLModel,
         decoder: MLModel,
         joint: MLModel,
@@ -59,6 +61,7 @@ public class StreamingSession {
         self.joint = joint
         self.vocabulary = vocabulary
         self.melPreprocessor = melPreprocessor
+        self.language = language
         let wordBoostingContext = WordBoostingContext(
             config: wordBoosting,
             vocabulary: vocabulary,
@@ -143,6 +146,9 @@ public class StreamingSession {
     deinit {
         argmaxBuf.deallocate()
     }
+
+    /// Sample rate accepted by the incremental session.
+    public var inputSampleRate: Int { config.sampleRate }
 
     /// Seconds of audio represented by one encoder output frame.
     public var frameDurationSeconds: Double {
@@ -353,5 +359,31 @@ public class StreamingSession {
                    (targetLength - actualLength) * stride)
         }
         return padded
+    }
+}
+
+extension StreamingSession: StreamingRecognitionSession {
+    public func push(_ chunk: CapturedAudioChunk) throws -> [StreamingRecognitionUpdate] {
+        guard chunk.sampleRate == inputSampleRate else {
+            throw StreamingRecognitionError.sampleRateMismatch(
+                expected: inputSampleRate, actual: chunk.sampleRate)
+        }
+        return try pushAudio(chunk.samples).map(unifiedUpdate)
+    }
+
+    public func finish() throws -> [StreamingRecognitionUpdate] {
+        try finalize().map(unifiedUpdate)
+    }
+
+    private func unifiedUpdate(
+        _ partial: NemotronStreamingASRModel.PartialTranscript
+    ) -> StreamingRecognitionUpdate {
+        StreamingRecognitionUpdate(
+            text: partial.text,
+            isFinal: partial.isFinal,
+            segmentIndex: partial.segmentIndex,
+            confidence: partial.confidence,
+            language: language,
+            words: partial.words)
     }
 }

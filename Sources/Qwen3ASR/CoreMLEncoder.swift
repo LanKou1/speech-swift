@@ -99,7 +99,7 @@ public class CoreMLASREncoder {
         let melTime = melFeatures.dim(1)
         let melData: [Float] = melFeatures.asArray(Float.self)
         let raw = try encodeRaw(melData: melData, melBins: melBins, realFrames: melTime)
-        return (multiArrayToMLXArray(raw.embeddings), raw.outputLength)
+        return (try multiArrayToMLXArray(raw.embeddings), raw.outputLength)
     }
 
     // MARK: - MLX-free encoding (for iOS background / pure CoreML path)
@@ -125,6 +125,19 @@ public class CoreMLASREncoder {
         return try encodeRaw(melData: melFeatures.data,
                              melBins: melFeatures.melBins,
                              realFrames: melFeatures.timeFrames)
+    }
+
+    /// Clamp a model-reported audio-token count to what the embeddings
+    /// tensor can actually supply.
+    ///
+    /// ``output_length`` is computed in-graph. A re-export whose length
+    /// formula outran its own output tensor would otherwise hand callers an
+    /// index range that reads past the buffer — the same class of fault as
+    /// reading the Float16 embeddings as Float32, arriving by a different
+    /// route. ``internal`` so it is unit-testable without the model.
+    static func clampOutputLength(_ reported: Int, embeddingShape shape: [Int]) -> Int {
+        let availableTokens = shape.count >= 2 ? shape[shape.count - 2] : 0
+        return min(max(0, reported), max(0, availableTokens))
     }
 
     /// Shared core: zero-pads ``melData`` to the fixed ``paddedMelLength``,
@@ -167,11 +180,17 @@ public class CoreMLASREncoder {
             throw AudioModelError.inferenceFailed(
                 operation: "CoreML encoder", reason: "Missing output_length output (encoder may be an older export without the chunked-attention mask)")
         }
-        let outLen = max(0, Int(lengthOut[0].int32Value))
+        let outLen = Self.clampOutputLength(
+            Int(lengthOut[0].int32Value),
+            embeddingShape: embeddings.shape.map { $0.intValue })
         return EncodedAudio(embeddings: embeddings, outputLength: outLen)
     }
 
-    private func multiArrayToMLXArray(_ array: MLMultiArray) -> MLXArray {
+    /// Throws rather than reinterpreting an unexpected dtype. Reading a
+    /// non-Float32 buffer through a `Float` pointer is precisely the defect
+    /// that shipped in the MLX-free path: it corrupts every value, and for
+    /// narrower dtypes it also runs off the end of the allocation.
+    private func multiArrayToMLXArray(_ array: MLMultiArray) throws -> MLXArray {
         let shape = array.shape.map { $0.intValue }
         let count = array.count
 
@@ -184,9 +203,16 @@ public class CoreMLASREncoder {
         case .float32:
             let src = array.dataPointer.assumingMemoryBound(to: Float.self)
             return MLXArray(Array(UnsafeBufferPointer(start: src, count: count)), shape)
+        case .double:
+            let src = array.dataPointer.assumingMemoryBound(to: Float64.self)
+            var floats = [Float](repeating: 0, count: count)
+            for i in 0..<count { floats[i] = Float(src[i]) }
+            return MLXArray(floats, shape)
         default:
-            let src = array.dataPointer.assumingMemoryBound(to: Float.self)
-            return MLXArray(Array(UnsafeBufferPointer(start: src, count: count)), shape)
+            throw AudioModelError.inferenceFailed(
+                operation: "CoreML encoder",
+                reason: "Unsupported audio_embeddings dtype (raw \(array.dataType.rawValue)) — "
+                    + "expected Float16, Float32 or Float64")
         }
     }
 }
@@ -224,7 +250,8 @@ extension Qwen3ASRModel {
             audioEmbeds: realEmbeds,
             textDecoder: textDecoder,
             language: language,
-            maxTokens: maxTokens
+            maxTokens: maxTokens,
+            checkCancellation: {}
         )
     }
 }

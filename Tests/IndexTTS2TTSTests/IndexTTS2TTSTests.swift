@@ -120,6 +120,100 @@ final class IndexTTS2TTSTests: XCTestCase {
         XCTAssertEqual(tokenizer.decode(ids), "HELLO WORLD")
     }
 
+    // MARK: - Tokenizer parity with the upstream IndexTTS2 text front end
+    //
+    // Upstream (`indextts/utils/front.py`) rewrites punctuation through
+    // `char_rep_map`, then `tokenize_by_CJK_char` puts a space before every
+    // CJK scalar and uppercases the rest before SentencePiece. The published
+    // `bpe.model` has no `▁`-prefixed CJK pieces, no digits, and none of
+    // `"`, `(`, `)`, `:`, `;`, `。`, `、`. Text that skips that front end
+    // either tokenizes differently from what the GPT was trained on or has
+    // no lattice path at all. Golden ids below come from upstream
+    // SentencePiece on a synthetic vocabulary that mirrors that layout.
+
+    func testIndexTTS2TokenizerSeparatesEveryCJKCharacter() throws {
+        let tokenizer = try IndexTTS2Tokenizer(pieces: Self.mandarinPieces)
+
+        // Upstream: ▁ 你 ▁ 好 ▁ 世 ▁ 界 — a standalone `▁` before each character.
+        XCTAssertEqual(try tokenizer.encode("你好世界"), [3, 4, 3, 5, 3, 6, 3, 7])
+    }
+
+    func testIndexTTS2TokenizerNormalizesCJKPunctuation() throws {
+        let tokenizer = try IndexTTS2Tokenizer(pieces: Self.mandarinPieces)
+
+        // `，` → `,` and `。` → `.`; `。` has no piece and used to throw `unencodableText`.
+        let ids = try tokenizer.encode("你好，这是一个中文合成测试。")
+        XCTAssertEqual(ids, [3, 4, 3, 5, 39, 3, 12, 3, 8, 3, 13, 3, 14, 3, 10, 3, 11, 3, 15, 3, 16, 3, 17, 3, 18, 40])
+        XCTAssertEqual(tokenizer.decode(ids), "你好,这是一个中文合成测试.")
+        XCTAssertEqual(try tokenizer.encode("你好！吗？"), [3, 4, 3, 5, 3, 36, 3, 22, 41])
+    }
+
+    func testIndexTTS2TokenizerHandlesMixedMandarinAndEnglish() throws {
+        let tokenizer = try IndexTTS2Tokenizer(pieces: Self.mandarinPieces)
+
+        let ids = try tokenizer.encode("你好世界是 hello world 的中文")
+        XCTAssertEqual(ids, [3, 4, 3, 5, 3, 6, 3, 7, 3, 8, 23, 24, 3, 9, 3, 10, 3, 11])
+        // Decoding drops the per-character spacing but keeps Latin word gaps.
+        XCTAssertEqual(tokenizer.decode(ids), "你好世界是 HELLO WORLD 的中文")
+    }
+
+    func testIndexTTS2TokenizerNormalizesLatinPunctuation() throws {
+        let tokenizer = try IndexTTS2Tokenizer(pieces: Self.mandarinPieces)
+
+        // `"`, `(`, `)` → `'` and `:` → `,`; none of the originals have pieces.
+        XCTAssertEqual(
+            try tokenizer.encode("Hello \"world\" (ok): done."),
+            [23, 3, 38, 26, 38, 3, 38, 28, 38, 34, 29, 35])
+        // Plain English is untouched by the front end.
+        XCTAssertEqual(try tokenizer.encode("Hello world."), [23, 24, 35])
+    }
+
+    func testIndexTTS2TokenizerEmitsSingleUnknownForUnsupportedScalars() throws {
+        let tokenizer = try IndexTTS2Tokenizer(pieces: Self.mandarinPieces)
+
+        // SentencePiece emits `<unk>` for uncovered scalars and merges runs.
+        XCTAssertEqual(try tokenizer.encode("你好🙂"), [3, 4, 3, 5, 3, 2])
+        XCTAssertEqual(try tokenizer.encode("A✿B"), [31, 2, 33])
+    }
+
+    func testIndexTTS2TokenizerReadsDigitsAsNumberWords() throws {
+        let tokenizer = try IndexTTS2Tokenizer(pieces: Self.mandarinPieces)
+
+        // The vocabulary has no digit pieces, so 2024年 is read out as
+        // 二零二四年 before the lattice sees it.
+        XCTAssertEqual(
+            try tokenizer.encode("今天是2024年"),
+            [3, 19, 3, 20, 3, 8, 3, 44, 3, 45, 3, 44, 3, 46, 3, 21])
+    }
+
+    /// Mirrors the published `bpe.model` layout: `<s>`/`</s>`/`<unk>` at
+    /// ids 0–2, a standalone `▁`, bare user-defined CJK scalars with score 0
+    /// (no `▁`-prefixed CJK pieces), uppercase Latin pieces, and ASCII
+    /// punctuation only — no digits and none of `"`, `(`, `)`, `:`, `;`, `。`.
+    private static let mandarinPieces: [SentencePieceModel.Piece] = {
+        func piece(
+            _ text: String, _ score: Float, _ type: SentencePieceModel.PieceType = .normal
+        ) -> SentencePieceModel.Piece {
+            SentencePieceModel.Piece(text: text, score: score, type: type.rawValue)
+        }
+        var pieces = [
+            piece("<s>", 0, .control),
+            piece("</s>", 0, .control),
+            piece("<unk>", 0, .unknown),
+            piece("▁", -0.28),
+        ]
+        pieces += "你好世界是的中文这一个合成测试今天年吗".map { piece(String($0), 0, .userDefined) }
+        pieces += [
+            piece("▁HELLO", -1), piece("▁WORLD", -1), piece("HELLO", -5), piece("WORLD", -5),
+            piece("▁OK", -2), piece("OK", -4), piece("▁DONE", -2), piece("DONE", -4),
+            piece("▁A", -3), piece("A", -6), piece("B", -6),
+            piece(",", -5.57), piece(".", -5.98), piece("!", -9.56), piece("?", -7.77), piece("'", -5.33),
+            piece("▁,", -3.28), piece("▁.", -4.06), piece("▁?", -6.21), piece("...", -8), piece("-", -11.47),
+            piece("二", 0, .userDefined), piece("零", 0, .userDefined), piece("四", 0, .userDefined),
+        ]
+        return pieces
+    }()
+
     func testIndexTTS2EmotionPresetVectors() throws {
         let eager = try IndexTTS2EmotionControl(preset: .eager, weight: 0.5)
 

@@ -27,6 +27,39 @@ for chunk in audioChunks {
 let finals = try session.finalize()
 ```
 
+### Model-agnostic streaming
+
+Both the Core ML and MLX models conform to AudioCommon's
+`StreamingRecognitionModel`. The common session owns its cache state and
+accepts ordered `CapturedAudioChunk` values, so callers can swap Nemotron and
+Parakeet without rebuilding the audio-input pipeline:
+
+```swift
+import AudioCommon
+
+let source = AudioFileLoader.stream(
+    url: inputURL,
+    options: AudioFileStreamOptions(
+        targetSampleRate: 16_000,
+        chunkDuration: 0.32,
+        channelSelection: .mixAll))
+let session = try model.makeStreamingSession(language: "de-DE")
+
+for try await chunk in source {
+    for update in try session.push(chunk) {
+        render(text: update.text, final: update.isFinal)
+    }
+}
+for update in try session.finish() {
+    render(text: update.text, final: true)
+}
+```
+
+`AudioFileLoader.stream` is pull-driven and bounded-memory. Multichannel files
+are averaged by default; use `.first` or `.select([indices])` when channel
+routing is known. Resampling happens in the source, because a session rejects
+chunks whose `sampleRate` does not equal its `inputSampleRate`.
+
 ## Native MLX INT5 and INT8
 
 `NemotronStreamingASRMLXModel` runs the quantized encoder, prompt kernel,

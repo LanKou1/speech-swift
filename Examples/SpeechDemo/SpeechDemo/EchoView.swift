@@ -22,6 +22,11 @@ struct EchoView: View {
             }
 
             if vm.modelsLoaded {
+                // End-of-turn classifier (applies to the next Start)
+                Toggle("Smart Turn end-of-turn detection", isOn: $vm.smartTurnEnabled)
+                    .toggleStyle(.switch)
+                    .disabled(vm.isRunning)
+
                 // State indicator + VAD level
                 HStack {
                     Circle()
@@ -31,6 +36,11 @@ struct EchoView: View {
                         .font(.headline)
                         .foregroundStyle(stateColor)
                     Spacer()
+                    if vm.isRunning, let probability = vm.lastTurnProbability {
+                        Text(String(format: "turn %.2f", probability))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
                     if vm.isRunning {
                         Text(String(format: "%.2f", vm.vadLevel))
                             .font(.system(.caption, design: .monospaced))
@@ -127,6 +137,7 @@ struct EchoView: View {
     private func logColor(for line: String) -> Color {
         if line.contains("[STT") { return .primary }
         if line.contains("[VAD]") { return .green }
+        if line.contains("[Turn]") { return .purple }
         if line.contains("[TTS") { return .blue }
         if line.contains("[ERROR") { return .red }
         if line.contains("[Interrupted") { return .orange }

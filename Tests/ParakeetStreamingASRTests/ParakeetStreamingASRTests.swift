@@ -7,6 +7,11 @@ import AudioCommon
 
 final class ParakeetStreamingASRTests: XCTestCase {
 
+    func testModelExposesUnifiedStreamingContract() {
+        func requireStreamingModel<T: StreamingRecognitionModel>(_: T.Type) {}
+        requireStreamingModel(ParakeetStreamingASRModel.self)
+    }
+
     // MARK: - Configuration Tests
 
     func testDefaultConfig() {
@@ -280,6 +285,28 @@ final class E2EParakeetStreamingASRTests: XCTestCase {
                       "Streamed text should include 'guarantee' but was: \(lastPartial.text)")
         XCTAssertTrue(lastPartial.text.contains("shipped tomorrow"),
                       "Streamed text should include 'shipped tomorrow' but was: \(lastPartial.text)")
+    }
+
+    func testUnifiedSessionConsumesIncrementalFileSource() async throws {
+        let m = try model
+        let audioURL = try XCTUnwrap(
+            Bundle.module.url(forResource: "test_audio", withExtension: "wav"))
+        let source = AudioFileLoader.stream(
+            url: audioURL,
+            options: AudioFileStreamOptions(
+                targetSampleRate: 16_000,
+                chunkDuration: 0.32))
+        let session = try m.makeStreamingSession(language: nil)
+        var updates: [StreamingRecognitionUpdate] = []
+
+        for try await chunk in source {
+            updates.append(contentsOf: try session.push(chunk))
+        }
+        updates.append(contentsOf: try session.finish())
+
+        let final = try XCTUnwrap(updates.last(where: \.isFinal))
+        XCTAssertFalse(final.text.isEmpty)
+        XCTAssertTrue(final.text.localizedCaseInsensitiveContains("replacement"))
     }
 
     func testStreamingSession() throws {

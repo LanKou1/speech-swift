@@ -47,6 +47,50 @@ final class E2EGemma4GenTests: XCTestCase {
         }
     }
 
+    func testCooperativeCancellationStopsBeforeTheNextToken() throws {
+        guard FileManager.default.fileExists(
+            atPath: Self.modelDir.appendingPathComponent("config.json").path) else {
+            throw XCTSkip("Gemma 4 model dir unavailable: \(Self.modelDir.path)")
+        }
+
+        let chat: Gemma4Chat
+        do {
+            chat = try Gemma4Chat.fromDirectory(Self.modelDir)
+        } catch {
+            throw XCTSkip("model load failed (weights/metallib): \(error)")
+        }
+
+        let prompt = Gemma4ChatTemplate.encode(
+            messages: [
+                ChatMessage(role: .system, content: "Answer directly."),
+                ChatMessage(role: .user, content: "Count upward forever."),
+            ],
+            tokenizer: chat.gemmaTokenizer
+        )
+        let sampling = ChatSamplingConfig(
+            temperature: 0,
+            topK: 0,
+            topP: 1.0,
+            maxTokens: 64,
+            repetitionPenalty: 1.0
+        )
+        var admissionChecks = 0
+        var emittedTokens = 0
+        chat.decode(
+            promptTokens: prompt,
+            sampling: sampling,
+            shouldContinue: {
+                admissionChecks += 1
+                return admissionChecks <= 2
+            },
+            onToken: { _ in emittedTokens += 1 },
+            onText: { _ in }
+        )
+
+        XCTAssertEqual(admissionChecks, 3)
+        XCTAssertEqual(emittedTokens, 2)
+    }
+
     /// Deterministic (no model): the reasoning-channel filter drops a `<|channel>thought … <channel|>`
     /// block and emits only the answer text after it, decoding the SentencePiece byte-fallback tokens.
     func testAnswerFilterSuppressesThoughtChannel() throws {

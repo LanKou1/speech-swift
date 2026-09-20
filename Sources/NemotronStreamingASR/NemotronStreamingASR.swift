@@ -84,6 +84,7 @@ public class NemotronStreamingASRModel {
         return try StreamingSession(
             config: config,
             languageSlot: slot,
+            language: language,
             encoder: encoder,
             decoder: decoder,
             joint: joint,
@@ -191,6 +192,7 @@ public class NemotronStreamingASRModel {
 
     public static func fromPretrained(
         modelId: String? = nil,
+        computeUnits: MLComputeUnits = .all,
         progressHandler: ((Double, String) -> Void)? = nil
     ) async throws -> NemotronStreamingASRModel {
         let effectiveModelId = modelId ?? defaultModelId
@@ -229,7 +231,12 @@ public class NemotronStreamingASRModel {
                 modelId: effectiveModelId, reason: "Download failed", underlying: error)
         }
 
-        return try await load(from: cacheDir, source: effectiveModelId, progressHandler: progressHandler)
+        return try await load(
+            from: cacheDir,
+            source: effectiveModelId,
+            computeUnits: computeUnits,
+            progressHandler: progressHandler
+        )
     }
 
     /// Load a model from a local directory (no download). The directory must
@@ -237,15 +244,22 @@ public class NemotronStreamingASRModel {
     /// `vocab.json`, `languages.json`, and optionally `config.json`.
     public static func fromLocal(
         bundleDir: URL,
+        computeUnits: MLComputeUnits = .all,
         progressHandler: ((Double, String) -> Void)? = nil
     ) async throws -> NemotronStreamingASRModel {
         AudioLog.modelLoading.info("Loading Nemotron Streaming from local: \(bundleDir.path)")
-        return try await load(from: bundleDir, source: bundleDir.path, progressHandler: progressHandler)
+        return try await load(
+            from: bundleDir,
+            source: bundleDir.path,
+            computeUnits: computeUnits,
+            progressHandler: progressHandler
+        )
     }
 
     private static func load(
         from cacheDir: URL,
         source: String,
+        computeUnits: MLComputeUnits,
         progressHandler: ((Double, String) -> Void)?
     ) async throws -> NemotronStreamingASRModel {
         progressHandler?(0.70, "Loading configuration...")
@@ -290,16 +304,19 @@ public class NemotronStreamingASRModel {
             )
         }
 
-        // `.all` lets CoreML schedule the encoder onto the ANE (which is what
-        // Python coremltools' `ComputeUnit.ALL` does). Encoder gains ~40% RTF
-        // over `.cpuAndGPU`. Decoder + joint are tiny enough that ANE vs CPU
-        // is a wash, but using `.all` keeps the unit selection consistent.
+        // Callers that share the GPU with another resident model can exclude
+        // it explicitly with `.cpuAndNeuralEngine`. `.all` remains the generic
+        // default to preserve existing clients and because a narrower placement
+        // still needs a model-, device-, and language-specific parity gate.
         progressHandler?(0.80, "Loading CoreML models...")
-        let encoder = try loadCoreMLModel(name: "encoder", from: cacheDir, computeUnits: .all)
+        let encoder = try loadCoreMLModel(
+            name: "encoder", from: cacheDir, computeUnits: computeUnits)
         progressHandler?(0.90, "Loading decoder...")
-        let decoder = try loadCoreMLModel(name: "decoder", from: cacheDir, computeUnits: .all)
+        let decoder = try loadCoreMLModel(
+            name: "decoder", from: cacheDir, computeUnits: computeUnits)
         progressHandler?(0.95, "Loading joint network...")
-        let joint = try loadCoreMLModel(name: "joint", from: cacheDir, computeUnits: .all)
+        let joint = try loadCoreMLModel(
+            name: "joint", from: cacheDir, computeUnits: computeUnits)
 
         progressHandler?(1.0, "Model loaded")
         AudioLog.modelLoading.info(
@@ -348,4 +365,12 @@ public class NemotronStreamingASRModel {
         return try MLModel(contentsOf: modelURL, configuration: mlConfig)
     }
 
+}
+
+extension NemotronStreamingASRModel: StreamingRecognitionModel {
+    public func makeStreamingSession(
+        language: String? = nil
+    ) throws -> any StreamingRecognitionSession {
+        try createSession(language: language)
+    }
 }

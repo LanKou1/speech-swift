@@ -170,7 +170,13 @@ public class ParakeetASRModel {
         let encoderOutput = try runEncoder(mel: paddedMel, length: effectiveLength)
         let encoded = encoderOutput.featureValue(for: "encoded")!.multiArrayValue!
         let encodedLength = encoderOutput.featureValue(for: "encoded_length")!.multiArrayValue![0].intValue
-        let tdtDecoder = TDTGreedyDecoder(config: config, decoder: decoder!, joint: joint!, maskedTokenIds: maskedTokenIds)
+        let tdtDecoder = TDTGreedyDecoder(
+            config: config,
+            decoder: decoder!,
+            joint: joint!,
+            vocabulary: vocabulary,
+            maskedTokenIds: maskedTokenIds
+        )
         return try tdtDecoder.decode(encoded: encoded, encodedLength: encodedLength)
     }
 

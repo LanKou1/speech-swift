@@ -69,6 +69,7 @@ final class RealtimeAPITests: XCTestCase {
         XCTAssertEqual(session?["language"] as? String, "english")
         XCTAssertEqual(session?["input_audio_format"] as? String, "pcm16")
         XCTAssertEqual(session?["output_audio_format"] as? String, "pcm16")
+        XCTAssertTrue(session?["turn_detection"] is NSNull)
         let modalities = session?["modalities"] as? [String]
         XCTAssertEqual(modalities, ["audio", "text"])
     }
@@ -96,6 +97,51 @@ final class RealtimeAPITests: XCTestCase {
         XCTAssertEqual(session?["language"] as? String, "chinese")
         XCTAssertEqual(session?["input_audio_format"] as? String, "pcm16")
         XCTAssertEqual(session?["output_audio_format"] as? String, "pcm16")
+    }
+
+    func testSessionUpdateEnablesAndEchoesServerVAD() async throws {
+        let ws = try await connect()
+        defer { ws.cancel(with: .normalClosure, reason: nil) }
+
+        _ = try await receiveJSON(ws)
+        try await sendJSON(ws, [
+            "type": "session.update",
+            "session": [
+                "turn_detection": [
+                    "type": "server_vad",
+                    "threshold": 0.65,
+                    "prefix_padding_ms": 420,
+                    "silence_duration_ms": 700,
+                    "max_turn_duration_ms": 30_000,
+                ] as [String: Any]
+            ] as [String: Any]
+        ] as [String: Any])
+
+        let message = try await receiveJSON(ws)
+        let session = message["session"] as? [String: Any]
+        let turnDetection = session?["turn_detection"] as? [String: Any]
+        XCTAssertEqual(turnDetection?["type"] as? String, "server_vad")
+        XCTAssertEqual((turnDetection?["threshold"] as? NSNumber)?.floatValue, 0.65)
+        XCTAssertEqual(turnDetection?["prefix_padding_ms"] as? Int, 420)
+        XCTAssertEqual(turnDetection?["silence_duration_ms"] as? Int, 700)
+        XCTAssertEqual(turnDetection?["max_turn_duration_ms"] as? Int, 30_000)
+    }
+
+    func testSessionUpdateRejectsUnknownTurnDetectionType() async throws {
+        let ws = try await connect()
+        defer { ws.cancel(with: .normalClosure, reason: nil) }
+
+        _ = try await receiveJSON(ws)
+        try await sendJSON(ws, [
+            "type": "session.update",
+            "session": ["turn_detection": ["type": "semantic_vad"]]
+        ] as [String: Any])
+
+        let message = try await receiveJSON(ws)
+        XCTAssertEqual(message["type"] as? String, "error")
+        XCTAssertTrue(
+            ((message["error"] as? [String: Any])?["message"] as? String)?
+                .contains("semantic_vad") ?? false)
     }
 
     func testInputAudioBufferClear() async throws {

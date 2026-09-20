@@ -604,6 +604,51 @@ final class EmbedSpeakerCommandTests: XCTestCase {
     }
 }
 
+// MARK: - TurnCommand
+
+final class TurnCommandTests: XCTestCase {
+
+    func testParsesDefaults() throws {
+        let command = try AudioCLI.parseAsRoot(["turn", "utterance.wav"])
+        let turn = try XCTUnwrap(command as? TurnCommand)
+
+        XCTAssertEqual(turn.audioFile, "utterance.wav")
+        XCTAssertEqual(turn.model, "aufklarer/Smart-Turn-v3.2-CoreML")
+        XCTAssertEqual(turn.threshold, 0.5)
+        XCTAssertFalse(turn.json)
+    }
+
+    func testParsesThresholdAndJSON() throws {
+        let command = try AudioCLI.parseAsRoot([
+            "turn", "utterance.wav", "--threshold", "0.7", "--json",
+        ])
+        let turn = try XCTUnwrap(command as? TurnCommand)
+
+        XCTAssertEqual(turn.threshold, 0.7)
+        XCTAssertTrue(turn.json)
+    }
+
+    func testParsesLocalModelDirectory() throws {
+        let command = try AudioCLI.parseAsRoot([
+            "turn", "utterance.wav", "--model-dir", "/tmp/smart-turn-coreml",
+        ])
+        let turn = try XCTUnwrap(command as? TurnCommand)
+
+        XCTAssertEqual(turn.modelDir, "/tmp/smart-turn-coreml")
+    }
+
+    func testVadStreamParsesSmartTurnFlag() throws {
+        let command = try AudioCLI.parseAsRoot([
+            "vad-stream", "call.wav", "--smart-turn", "--turn-max-silence", "1.5",
+        ])
+        let vadStream = try XCTUnwrap(command as? VadStreamCommand)
+
+        XCTAssertTrue(vadStream.smartTurn)
+        XCTAssertEqual(vadStream.turnMaxSilence, 1.5)
+        XCTAssertEqual(vadStream.turnThreshold, 0.5)
+    }
+}
+
 // MARK: - SpeakCommand
 
 final class SpeakCommandTests: XCTestCase {

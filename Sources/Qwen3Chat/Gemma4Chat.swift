@@ -93,13 +93,32 @@ public final class Gemma4Chat: @unchecked Sendable {
     public func generateStream(
         messages: [ChatMessage], sampling: ChatSamplingConfig = .default
     ) -> AsyncThrowingStream<String, Error> {
+        generateStream(
+            messages: messages,
+            sampling: sampling,
+            shouldContinue: { true })
+    }
+
+    /// Streaming generation with cooperative token-boundary cancellation.
+    ///
+    /// MLX evaluation of one token and the initial prompt prefill are atomic,
+    /// but the caller can stop before the next token is scheduled. Returning
+    /// from `decode` also guarantees the producer is finished before a shared
+    /// model is used by the next request.
+    public func generateStream(
+        messages: [ChatMessage],
+        sampling: ChatSamplingConfig = .default,
+        shouldContinue: @escaping @Sendable () -> Bool
+    ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             Task {
                 let promptTokens = Gemma4ChatTemplate.encode(
                     messages: messages, tokenizer: self.gemmaTokenizer)
-                self.decode(promptTokens: promptTokens, sampling: sampling) { text in
-                    continuation.yield(text)
-                }
+                self.decode(
+                    promptTokens: promptTokens,
+                    sampling: sampling,
+                    shouldContinue: shouldContinue,
+                    onText: { text in continuation.yield(text) })
                 continuation.finish()
             }
         }
@@ -118,6 +137,7 @@ public final class Gemma4Chat: @unchecked Sendable {
     func decode(
         promptTokens: [Int],
         sampling: ChatSamplingConfig,
+        shouldContinue: () -> Bool = { true },
         onToken: (Int) -> Void = { _ in },
         onText: (String) -> Void
     ) {
@@ -134,7 +154,7 @@ public final class Gemma4Chat: @unchecked Sendable {
         let endTokens = Array(gemmaTokenizer.eosTokenIds)
 
         var remaining = sampling.maxTokens
-        while remaining > 0 {
+        while remaining > 0 && shouldContinue() {
             remaining -= 1
 
             let next = ChatSampler.sampleOnDevice(

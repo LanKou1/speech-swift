@@ -123,7 +123,7 @@ The same skills are exposed to agents that scan `.codex/skills/` through relativ
 - `Sources/MADLADTranslation/` — Text translation (MLX)
 
 **Audio Processing**
-- `Sources/SpeechVAD/` — VAD (Silero + Pyannote), speaker diarization, speaker embedding (WeSpeaker)
+- `Sources/SpeechVAD/` — VAD (Silero + Pyannote), end-of-turn detection (Smart Turn v3.2, CoreML), speaker diarization, speaker embedding (WeSpeaker)
 - `Sources/SpeechEnhancement/` — Noise suppression (DeepFilterNet3, CoreML)
 - `Sources/SpeechRestoration/` — Audio restoration (CoreML)
 - `Sources/SourceSeparation/` — Source separation (MLX)
@@ -276,6 +276,7 @@ docs/
     parakeet-asr.md             Parakeet TDT architecture
     personaplex.md              PersonaPlex architecture
     fireredvad.md               FireRedVAD (DFSMN) architecture
+    smart-turn-v3.md            Smart Turn v3.2 end-of-turn classifier (CoreML)
   inference/                    Pipelines, usage, configs
     qwen3-asr-inference.md      Qwen3-ASR inference pipeline
     parakeet-asr-inference.md   Parakeet TDT inference (CoreML)
@@ -285,6 +286,7 @@ docs/
     magnet-music-gen.md         MAGNeT music generation CLI + tuning
     forced-aligner.md           Forced alignment pipeline
     silero-vad.md               Silero VAD streaming
+    smart-turn.md               Smart Turn end-of-turn confirmation, tuning, CLI
     fireredvad.md               FireRedVAD inference + tuning results
     speaker-diarization.md      Speaker diarization pipeline
     speech-enhancement.md       DeepFilterNet3 pipeline

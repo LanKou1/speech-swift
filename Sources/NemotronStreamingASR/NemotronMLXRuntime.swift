@@ -217,7 +217,8 @@ public final class NemotronStreamingASRMLXModel: @unchecked Sendable {
         defer { inferenceLock.unlock() }
         return try NemotronMLXStreamingSession(
             model: self,
-            languageSlot: languages.slot(for: language)
+            languageSlot: languages.slot(for: language),
+            language: language
         )
     }
 
@@ -301,9 +302,18 @@ public final class NemotronStreamingASRMLXModel: @unchecked Sendable {
     static let coreStreamingConfiguration = NemotronStreamingConfig.default
 }
 
+extension NemotronStreamingASRMLXModel: StreamingRecognitionModel {
+    public func makeStreamingSession(
+        language: String? = nil
+    ) throws -> any StreamingRecognitionSession {
+        try createSession(language: language)
+    }
+}
+
 public final class NemotronMLXStreamingSession {
     private let model: NemotronStreamingASRMLXModel
     private let configuration: NemotronMLXConfiguration
+    private let language: String?
     private let languageMask: MLXArray
     private let caches: [NemotronMLXLayerCache]
 
@@ -321,10 +331,12 @@ public final class NemotronMLXStreamingSession {
 
     init(
         model: NemotronStreamingASRMLXModel,
-        languageSlot: Int
+        languageSlot: Int,
+        language: String?
     ) throws {
         self.model = model
         configuration = model.configuration
+        self.language = language
         guard
             (0..<configuration.promptKernel.promptCount)
                 .contains(languageSlot)
@@ -367,6 +379,10 @@ public final class NemotronMLXStreamingSession {
     public var frameDurationSeconds: Double {
         Double(configuration.encoder.subsamplingFactor)
             * configuration.preprocessor.windowStride
+    }
+
+    public var inputSampleRate: Int {
+        NemotronStreamingASRMLXModel.inputSampleRate
     }
 
     public func pushAudio(
@@ -560,5 +576,31 @@ public final class NemotronMLXStreamingSession {
             wordBoostingChangedDecisions: 0,
             words: words
         )
+    }
+}
+
+extension NemotronMLXStreamingSession: StreamingRecognitionSession {
+    public func push(_ chunk: CapturedAudioChunk) throws -> [StreamingRecognitionUpdate] {
+        guard chunk.sampleRate == inputSampleRate else {
+            throw StreamingRecognitionError.sampleRateMismatch(
+                expected: inputSampleRate, actual: chunk.sampleRate)
+        }
+        return try pushAudio(chunk.samples).map(unifiedUpdate)
+    }
+
+    public func finish() throws -> [StreamingRecognitionUpdate] {
+        try finalize().map(unifiedUpdate)
+    }
+
+    private func unifiedUpdate(
+        _ partial: NemotronStreamingASRModel.PartialTranscript
+    ) -> StreamingRecognitionUpdate {
+        StreamingRecognitionUpdate(
+            text: partial.text,
+            isFinal: partial.isFinal,
+            segmentIndex: partial.segmentIndex,
+            confidence: partial.confidence,
+            language: language,
+            words: partial.words)
     }
 }

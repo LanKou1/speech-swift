@@ -9,6 +9,13 @@ public struct ParakeetVocabulary: Sendable {
     /// Mapping from token ID to token string.
     private let idToToken: [Int: String]
 
+    /// Token IDs used for model control rather than transcript text.
+    ///
+    /// Parakeet's tokenizer interleaves plain digit tokens with control tokens, so token IDs
+    /// cannot be classified using a numeric boundary. Special tokens use angle-bracket syntax
+    /// (`<unk>`, `<pad>`, `<|pnc|>`, `<|en|>`, and similar).
+    private let specialTokenIds: Set<Int>
+
     /// Number of tokens in the vocabulary (excluding blank).
     public var count: Int { idToToken.count }
 
@@ -21,7 +28,22 @@ public struct ParakeetVocabulary: Sendable {
     /// Initialize from a pre-loaded dictionary.
     public init(idToToken: [Int: String]) {
         self.idToToken = idToToken
+        self.specialTokenIds = Self.extractSpecialTokenIds(from: idToToken)
         self.languageTagIds = Self.extractLanguageTags(from: idToToken)
+    }
+
+    /// Whether an emitted token belongs in transcript text.
+    ///
+    /// Unknown IDs are excluded as well: a model/vocabulary mismatch should not contribute an
+    /// undecodable token or confidence score to the returned transcription.
+    func isTextToken(_ id: Int) -> Bool {
+        idToToken[id] != nil && !specialTokenIds.contains(id)
+    }
+
+    private static func extractSpecialTokenIds(from idToToken: [Int: String]) -> Set<Int> {
+        Set(idToToken.compactMap { id, token in
+            token.hasPrefix("<") && token.hasSuffix(">") ? id : nil
+        })
     }
 
     /// Pull `<|xx|>` language tags out of the vocab. Control tokens (`<|pnc|>`, `<|emo:...|>`,

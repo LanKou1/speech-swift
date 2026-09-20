@@ -39,6 +39,41 @@ model emits them. Each value carries:
 | `eouDetected` | `true` if the joint's EOU head fired (vs force-finalized) |
 | `segmentIndex` | Monotonic utterance index, increments on each final |
 
+### Model-agnostic streaming
+
+`ParakeetStreamingASRModel` also conforms to AudioCommon's
+`StreamingRecognitionModel`. Use this interface when the same capture or file
+pipeline must work with Parakeet, Nemotron Core ML, or Nemotron MLX without
+engine-specific session code:
+
+```swift
+import AudioCommon
+
+let source = AudioFileLoader.stream(
+    url: inputURL,
+    options: AudioFileStreamOptions(
+        targetSampleRate: 16_000,
+        chunkDuration: 0.32,
+        channelSelection: .mixAll))
+let session = try model.makeStreamingSession(language: nil)
+
+for try await chunk in source {
+    for update in try session.push(chunk) {
+        if update.isFinal { commit(update.text) }
+        else               { showPartial(update.text) }
+    }
+}
+for update in try session.finish() {
+    commit(update.text)
+}
+```
+
+`AudioFileLoader.stream` is pull-driven and keeps decoding memory bounded.
+It mixes all input channels by default so speech isolated to a non-zero channel
+is not discarded; choose `.first` or `.select([indices])` for explicit routing.
+The source resamples before delivery, because a recognition session rejects
+chunks whose `sampleRate` differs from `inputSampleRate`.
+
 ## Long-lived session API (mic input)
 
 For live dictation, create a session once and feed it chunks as they come

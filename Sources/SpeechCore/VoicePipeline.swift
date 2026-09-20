@@ -62,6 +62,14 @@ public struct PipelineConfig {
     public var eagerSTTDelay: Float = 0.3
     /// Run dummy STT transcription at pipeline start to warm up Neural Engine.
     public var warmupSTT: Bool = true
+    /// End-of-turn classifier threshold (0-1). Only used once a `TurnCompletionProvider`
+    /// is attached with `setTurnCompletion(_:)`: a VAD pause ends the user's turn when
+    /// the classifier's completion probability is at or above this value; below it the
+    /// pipeline keeps listening and treats speech that resumes as the same turn.
+    public var turnCompletionThreshold: Float = 0.5
+    /// Seconds of silence, measured from the start of the pause, after which a turn the
+    /// classifier vetoed ends anyway. 0 = never (the turn waits for more speech).
+    public var turnCompletionMaxSilence: Float = 2.0
     public var language: String = ""
     public var mode: PipelineMode = .echo
 
@@ -111,6 +119,16 @@ private final class VADBridge {
     init(_ model: StreamingVADProvider) { self.model = model }
 }
 
+/// Bridges a TurnCompletionProvider to the C vtable.
+///
+/// Internal (not private) so the vtable can be exercised in isolation by the
+/// unit tests without a running pipeline.
+final class TurnCompletionBridge {
+    let model: TurnCompletionProvider
+
+    init(_ model: TurnCompletionProvider) { self.model = model }
+}
+
 /// Bridges a PipelineLLM to the C vtable.
 private final class LLMBridge {
     let model: PipelineLLM
@@ -146,6 +164,7 @@ private final class EventBridge {
 ///     config: .init(mode: .echo),
 ///     onEvent: { event in print(event) }
 /// )
+/// pipeline.setTurnCompletion(smartTurn)   // optional end-of-turn classifier
 /// pipeline.start()
 /// pipeline.pushAudio(micSamples)
 /// ```
@@ -158,6 +177,7 @@ public final class VoicePipeline {
     private let ttsBridge: TTSBridge
     private let vadBridge: VADBridge
     private var llmBridge: LLMBridge?
+    private var turnCompletionBridge: TurnCompletionBridge?
     private let eventBridge: EventBridge
 
     /// Create a voice pipeline.
@@ -202,6 +222,8 @@ public final class VoicePipeline {
         cConfig.post_playback_guard = config.postPlaybackGuard
         cConfig.eager_stt = config.eagerSTT
         cConfig.eager_stt_delay = config.eagerSTTDelay
+        cConfig.turn_completion_threshold = config.turnCompletionThreshold
+        cConfig.turn_completion_max_silence = config.turnCompletionMaxSilence
         cConfig.warmup_stt = config.warmupSTT
         cConfig.mode = sc_mode_t(rawValue: UInt32(config.mode.rawValue))
 
@@ -235,6 +257,9 @@ public final class VoicePipeline {
         Unmanaged.passUnretained(vadBridge).release()
         if let llmBridge {
             Unmanaged.passUnretained(llmBridge).release()
+        }
+        if let turnCompletionBridge {
+            Unmanaged.passUnretained(turnCompletionBridge).release()
         }
         Unmanaged.passUnretained(eventBridge).release()
         for bridge in toolBridges {
@@ -276,6 +301,40 @@ public final class VoicePipeline {
 
     public var isRunning: Bool {
         sc_pipeline_is_running(handle)
+    }
+
+    // MARK: - End-of-Turn Classifier
+
+    /// Attach an end-of-turn classifier such as `SmartTurnModel`.
+    ///
+    /// With a classifier attached, a VAD pause only ends the user's turn when
+    /// `turnCompleteProbability(audio:sampleRate:)` returns at least
+    /// `PipelineConfig.turnCompletionThreshold`. Below it the pipeline keeps
+    /// listening: speech that resumes continues the same turn (no second
+    /// `speechStarted`), and `PipelineConfig.turnCompletionMaxSilence` of
+    /// continued silence ends the turn anyway. Eager STT respects the veto.
+    ///
+    /// The classifier runs synchronously on the audio thread inside
+    /// `pushAudio(_:)`, once per pause, on the audio of the turn so far at the
+    /// VAD's sample rate. A classifier that throws counts as "turn complete",
+    /// so a failing model never stalls the conversation.
+    ///
+    /// Must be called before `start()`. Pass `nil` to detach.
+    public func setTurnCompletion(_ model: TurnCompletionProvider?) {
+        let previous = turnCompletionBridge
+        if let model {
+            let bridge = TurnCompletionBridge(model)
+            turnCompletionBridge = bridge
+            sc_pipeline_set_turn_completion(handle, Self.makeTurnCompletionVtable(bridge))
+        } else {
+            turnCompletionBridge = nil
+            sc_pipeline_set_turn_completion(
+                handle, sc_turn_completion_vtable_t(context: nil, turn_complete_probability: nil))
+        }
+        // The engine no longer references the old context once the call returns.
+        if let previous {
+            Unmanaged.passUnretained(previous).release()
+        }
     }
 
     // MARK: - Tool Calling
@@ -490,6 +549,37 @@ public final class VoicePipeline {
             chunk_size: { ctx in
                 let bridge = Unmanaged<VADBridge>.fromOpaque(ctx!).takeUnretainedValue()
                 return bridge.model.chunkSize
+            }
+        )
+    }
+
+    // MARK: - Turn Completion Vtable
+
+    /// Build the C vtable for an end-of-turn classifier. Retains `bridge` once;
+    /// the owner releases it via `Unmanaged.passUnretained(bridge).release()`.
+    static func makeTurnCompletionVtable(_ bridge: TurnCompletionBridge) -> sc_turn_completion_vtable_t {
+        let ctx = Unmanaged.passRetained(bridge).toOpaque()
+        return sc_turn_completion_vtable_t(
+            context: ctx,
+            turn_complete_probability: { ctx, samples, length, sampleRate in
+                // Fail open on every path: 1.0 lets the VAD pause end the turn
+                // exactly as it would without a classifier.
+                guard let ctx else { return 1.0 }
+                let bridge = Unmanaged<TurnCompletionBridge>.fromOpaque(ctx).takeUnretainedValue()
+                let audio: [Float]
+                if let samples, length > 0 {
+                    audio = Array(UnsafeBufferPointer(start: samples, count: length))
+                } else {
+                    audio = []
+                }
+                do {
+                    return try bridge.model.turnCompleteProbability(
+                        audio: audio, sampleRate: Int(sampleRate))
+                } catch {
+                    AudioLog.pipeline.error(
+                        "Turn completion classifier failed, ending turn: \(error.localizedDescription)")
+                    return 1.0
+                }
             }
         )
     }

@@ -9,6 +9,7 @@ C++ pipeline engine (`speech-core` xcframework) orchestrating VAD, STT, LLM, and
 ```
 Idle --> [push_audio + VAD onset] --> Listening
 Listening --> [VAD offset + silence confirmed] --> Transcribing
+Listening --> [pause vetoed by end-of-turn classifier] --> Listening (turn held)
 Transcribing --> [STT complete, echo mode] --> Speaking
 Transcribing --> [STT complete, pipeline mode] --> Thinking
 Thinking --> [LLM complete] --> Speaking
@@ -17,8 +18,8 @@ Any --> [user interruption] --> Listening (TTS cancelled)
 ```
 
 - **Idle**: No audio processing. Waiting for `push_audio` calls.
-- **Listening**: VAD has detected speech onset. Audio is accumulating for STT.
-- **Transcribing**: VAD detected speech offset and silence was confirmed. STT is running on the accumulated audio.
+- **Listening**: VAD has detected speech onset. Audio is accumulating for STT. With an end-of-turn classifier attached, a pause the classifier vetoes keeps the pipeline here with the turn held open (see [End-of-turn classifier](#end-of-turn-classifier-smart-turn)).
+- **Transcribing**: VAD detected speech offset and silence was confirmed (and the end-of-turn classifier agreed, if one is attached). STT is running on the accumulated audio.
 - **Thinking**: STT produced a transcription, now waiting for LLM to generate a response (pipeline mode only).
 - **Speaking**: TTS is synthesizing and playing audio. Transitions back to Idle when playback completes and `resume_listening()` is called.
 
@@ -32,7 +33,7 @@ The pipeline emits events through the event bridge as the state machine progress
 |-------|-----------|
 | `sessionCreated` | Pipeline initialized and ready |
 | `speechStarted` | VAD onset detected |
-| `speechEnded` | VAD offset confirmed (silence threshold met) |
+| `speechEnded` | VAD offset confirmed (silence threshold met); with a classifier attached, only once it agrees the turn is complete or `turnCompletionMaxSilence` elapses |
 | `transcriptionCompleted` | STT finished, transcription text available |
 | `responseCreated` | LLM response generated (pipeline mode) |
 | `responseInterrupted` | User interrupted during TTS playback |
@@ -70,6 +71,8 @@ Full voice agent: STT → LLM → TTS. The user's transcription is sent to the L
 | `maxResponseDuration` | 30s | Maximum TTS playback duration before auto-stop |
 | `maxUtteranceDuration` | 30s | Maximum recording duration before forced STT |
 | `warmupSTT` | true | Run a warmup inference on pipeline init to precompile CoreML/MLX |
+| `turnCompletionThreshold` | 0.5 | Completion probability at or above which a VAD pause ends the turn. Only used once a classifier is attached with `setTurnCompletion(_:)` |
+| `turnCompletionMaxSilence` | 2.0s | Silence, measured from the start of the pause, after which a turn the classifier vetoed ends anyway. 0 = never |
 
 ## Architecture
 
@@ -92,6 +95,37 @@ Utterances are processed one at a time. If multiple utterances arrive while one 
 `push_audio` is called on the microphone thread with raw PCM samples. Inside `push_audio`, the pipeline mutex is held briefly to run VAD on the incoming audio. If VAD detects speech, the audio is appended to the utterance buffer.
 
 STT runs on the worker thread **without** the pipeline mutex held. This means audio continues flowing into the VAD during STT inference — if the user starts speaking again during transcription, the new speech is detected immediately.
+
+### End-of-turn classifier (Smart Turn)
+
+Silence alone is a weak signal for the end of a turn: people pause mid-sentence to think, and a VAD-only detector cuts them off. `setTurnCompletion(_:)` attaches an optional `TurnCompletionProvider` such as `SmartTurnModel` (Pipecat Smart Turn v3.2, CoreML). Call it before `start()`; pass `nil` to detach.
+
+```swift
+import SpeechCore
+import SpeechVAD
+
+let smartTurn = try await SmartTurnModel.fromPretrained()
+try smartTurn.prewarm()
+
+var config = PipelineConfig()
+config.turnCompletionThreshold = 0.5   // default
+config.turnCompletionMaxSilence = 2.0  // default
+
+let pipeline = VoicePipeline(stt: asr, tts: tts, vad: vad, config: config) { event in ... }
+pipeline.setTurnCompletion(smartTurn)
+pipeline.start()
+```
+
+With a classifier attached, a VAD pause becomes a question rather than a verdict:
+
+1. On a confirmed pause (or, with `eagerSTT`, at the eager moment) the engine calls `turnCompleteProbability(audio:sampleRate:)` with the audio of the turn so far, at the VAD sample rate (Smart Turn looks at the last 8 s).
+2. Probability at or above `turnCompletionThreshold`: the turn ends as before — `speechEnded`, then STT.
+3. Below it, the turn is **held**: the pipeline stays in Listening, audio keeps accumulating, and if the user speaks again it continues the *same* turn (no second `speechStarted`). The next pause asks the classifier again on the whole turn.
+4. If silence continues for `turnCompletionMaxSilence` (measured from the start of the pause; 0 = never), the turn ends anyway, so a user who trails off still gets a reply.
+
+Eager STT respects the veto: a mid-sentence pause no longer produces an early partial utterance. The `maxUtteranceDuration` force-split bypasses the classifier, and it is never consulted while the agent is speaking, so the interruption path is unchanged.
+
+The call runs synchronously on the audio thread inside `pushAudio(_:)`, once per pause — a few milliseconds for Smart Turn on Apple Silicon; call `prewarm()` after loading so the first pause does not pay for graph compilation. A classifier that throws counts as "turn complete" (the bridge returns 1.0 and logs the error), so a failing model never stalls the conversation. The pipeline events do not carry the probability; wrap the provider if you want to log it.
 
 ### TTS Blocking
 
@@ -117,6 +151,7 @@ The Swift layer bridges the C++ pipeline engine with Swift model implementations
 | `STTBridge` | Wraps Qwen3-ASR or Parakeet for speech-to-text |
 | `TTSBridge` | Wraps Qwen3-TTS, CosyVoice, VoxCPM2, or Kokoro for text-to-speech |
 | `VADBridge` | Wraps Silero VAD for voice activity detection |
+| `TurnCompletionBridge` | Wraps a `TurnCompletionProvider` (Smart Turn) as the end-of-turn classifier, attached with `setTurnCompletion(_:)` |
 | `LLMBridge` | Wraps Qwen3-Chat or external LLM for response generation |
 | `EventBridge` | Receives C++ events and dispatches to Swift handlers |
 
@@ -132,7 +167,7 @@ eventBridge.onEvent = { event in
 
 ## Known Limitations
 
-- **STT blocks worker for 2-3s** (Parakeet CoreML on Neural Engine). Phrases spoken during STT inference queue up and are processed in the next cycle. Enabling `eagerSTT` can reduce perceived latency but risks cutting off the user mid-sentence.
+- **STT blocks worker for 2-3s** (Parakeet CoreML on Neural Engine). Phrases spoken during STT inference queue up and are processed in the next cycle. Enabling `eagerSTT` can reduce perceived latency but risks cutting off the user mid-sentence; attaching an end-of-turn classifier removes most of that risk, since the eager utterance only fires on pauses the classifier accepts.
 
 - **TTS blocks worker** — concurrent TTS is not supported. If a second utterance arrives while TTS is still playing, it waits in the queue. This prevents interleaved audio but adds latency for rapid back-and-forth conversations.
 

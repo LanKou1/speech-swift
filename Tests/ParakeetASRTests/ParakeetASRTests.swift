@@ -95,6 +95,48 @@ final class ParakeetASRTests: XCTestCase {
         XCTAssertEqual(text, "unbelievable")
     }
 
+    func testVocabularyClassifiesTextByTokenSyntaxRatherThanIdRange() {
+        let vocab = ParakeetVocabulary(idToToken: [
+            0: "<unk>",
+            5: "<|pnc|>",
+            64: "<|en|>",
+            233: "<|spk15|>",
+            234: "0",
+            235: "1",
+            243: "9",
+            244: "<|spltoken0|>",
+            273: "<|spltoken29|>",
+            274: "en",
+            8_000: "<|future_control|>",
+        ])
+
+        // Digit tokens are interleaved with special-token ranges in the shipped vocabulary.
+        XCTAssertTrue(vocab.isTextToken(234))
+        XCTAssertTrue(vocab.isTextToken(235))
+        XCTAssertTrue(vocab.isTextToken(243))
+        XCTAssertTrue(vocab.isTextToken(274))
+
+        for id in [0, 5, 64, 233, 244, 273, 8_000] {
+            XCTAssertFalse(vocab.isTextToken(id), "Token ID \(id) should be special")
+        }
+        XCTAssertFalse(vocab.isTextToken(9_999), "Unknown IDs should not be emitted")
+    }
+
+    func testVocabularyDecodesDigitTokensBelowFormerTextBoundary() {
+        let vocab = ParakeetVocabulary(idToToken: [
+            234: "0",
+            235: "1",
+            236: "2",
+            237: "3",
+            7_863: "\u{2581}",
+        ])
+
+        let textTokenIds = [7_863, 235, 7_863, 236, 7_863, 237]
+            .filter(vocab.isTextToken)
+
+        XCTAssertEqual(vocab.decode(textTokenIds), "1 2 3")
+    }
+
     func testVocabularyEmpty() {
         let vocab = ParakeetVocabulary(idToToken: [:])
         let text = vocab.decode([0, 1, 2])

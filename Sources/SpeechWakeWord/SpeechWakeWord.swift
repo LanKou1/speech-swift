@@ -54,7 +54,9 @@ public final class WakeWordDetector {
     /// Create a new streaming detection session sharing this detector's models
     /// and context graph. Call ``WakeWordSession/reset()`` between unrelated
     /// audio streams.
-    public func createSession() throws -> WakeWordSession {
+    public func createSession(
+        options: WakeWordDecodingOptions = WakeWordDecodingOptions()
+    ) throws -> WakeWordSession {
         guard _isLoaded, let encoder, let decoder, let joiner else {
             throw AudioModelError.inferenceFailed(operation: "createSession", reason: "Model not loaded")
         }
@@ -64,20 +66,25 @@ public final class WakeWordDetector {
             decoder: decoder,
             joiner: joiner,
             fbank: fbank,
-            contextGraph: contextGraph
+            contextGraph: contextGraph,
+            options: options
         )
     }
 
     /// Batch-detect keyword occurrences in a full audio buffer.
     /// Convenience wrapper around ``createSession``. Resamples to 16 kHz if needed.
-    public func detect(audio: [Float], sampleRate: Int) throws -> [KeywordDetection] {
+    public func detect(
+        audio: [Float],
+        sampleRate: Int,
+        options: WakeWordDecodingOptions = WakeWordDecodingOptions()
+    ) throws -> [KeywordDetection] {
         let samples: [Float]
         if sampleRate != config.feature.sampleRate {
             samples = AudioFileLoader.resample(audio, from: sampleRate, to: config.feature.sampleRate)
         } else {
             samples = audio
         }
-        let session = try createSession()
+        let session = try createSession(options: options)
         var detections = try session.pushAudio(samples)
         detections.append(contentsOf: try session.finalize())
         return detections
@@ -103,6 +110,14 @@ public final class WakeWordDetector {
         guard let decoder = decoder, let joiner = joiner else {
             throw AudioModelError.inferenceFailed(operation: "makeKwsDecoder", reason: "Model not loaded")
         }
+        let resolvedOptions = try WakeWordDecodingOptions(
+            beam: beam,
+            numTrailingBlanks: numTrailingBlanks,
+            autoResetSeconds: autoResetSeconds
+        ).resolved(
+            defaultNumTrailingBlanks: config.kws.defaultNumTrailingBlanks,
+            defaultAutoResetSeconds: config.kws.autoResetSeconds
+        )
         let graph = ContextGraph(contextScore: contextScore, acThreshold: acThreshold)
         var ids: [[Int]] = []
         var phrases: [String] = []
@@ -138,11 +153,11 @@ public final class WakeWordDetector {
             blankId: config.decoder.blankId,
             unkId: nil,
             contextSize: ctxSize,
-            beam: beam,
-            numTrailingBlanks: numTrailingBlanks,
+            beam: resolvedOptions.beam,
+            numTrailingBlanks: resolvedOptions.numTrailingBlanks,
             blankPenalty: 0,
             frameShiftSeconds: 0.04,
-            autoResetSeconds: autoResetSeconds
+            autoResetSeconds: resolvedOptions.autoResetSeconds
         )
     }
 

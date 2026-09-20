@@ -95,9 +95,14 @@ final class WAVParsingSecurityTests: XCTestCase {
         let (samples, rate) = try AudioFileLoader.loadWAV(url: url)
         XCTAssertEqual(rate, 16000)
         XCTAssertEqual(samples.count, 4, "Should have 4 mono frames from 4 stereo frames")
-        // First channel values
-        XCTAssertEqual(samples[0], Float(100) / 32768.0, accuracy: 0.0001)
-        XCTAssertEqual(samples[1], Float(200) / 32768.0, accuracy: 0.0001)
+        // The safe default mixes every channel, so opposite-polarity pairs cancel.
+        XCTAssertEqual(samples[0], 0, accuracy: 0.0001)
+        XCTAssertEqual(samples[1], 0, accuracy: 0.0001)
+
+        // Historical channel-zero behavior remains available explicitly.
+        let firstChannel = try AudioFileLoader.loadWAV(url: url, channelSelection: .first).samples
+        XCTAssertEqual(firstChannel[0], Float(100) / 32768.0, accuracy: 0.0001)
+        XCTAssertEqual(firstChannel[1], Float(200) / 32768.0, accuracy: 0.0001)
     }
 
     // MARK: - Truncated / Too Small

@@ -40,6 +40,9 @@ public final class SpeechRestorer {
     var predictor: SidonPredictorModel?
     var vocoder: SidonVocoderModel?
     let variant: SidonVariant
+    /// Compute units each stage was loaded with (before any
+    /// `SPEECH_COREML_COMPUTE_UNITS` env override applied by `CoreMLLoader`).
+    public let placement: SidonComputePlacement
     var _isLoaded = true
 
     init(
@@ -47,12 +50,14 @@ public final class SpeechRestorer {
         vocoder: SidonVocoderModel?,
         config: SidonConfig,
         variant: SidonVariant,
+        placement: SidonComputePlacement = .default,
         loaded: Bool = true
     ) {
         self.predictor = predictor
         self.vocoder = vocoder
         self.config = config
         self.variant = variant
+        self.placement = placement
         self._isLoaded = loaded
     }
 
@@ -63,16 +68,31 @@ public final class SpeechRestorer {
     /// - Parameters:
     ///   - variant: precision variant (`.fp16` default, `.int8` for smaller).
     ///   - modelId: HuggingFace repo id (override if the published id differs).
-    ///   - computeUnits: CoreML compute units (default `.all`; honors the
-    ///     `SPEECH_COREML_COMPUTE_UNITS` env override via `CoreMLLoader`).
+    ///   - computeUnits: uniform Core ML compute units for both stages. Leave
+    ///     nil (default) to use the per-stage defaults in
+    ///     `SidonComputePlacement` — predictor `.all`, vocoder `.cpuAndGPU`
+    ///     (the vocoder's Neural Engine compile takes minutes and can fail).
+    ///   - predictorComputeUnits: per-stage override for the predictor; wins
+    ///     over `computeUnits`.
+    ///   - vocoderComputeUnits: per-stage override for the vocoder; wins over
+    ///     `computeUnits`.
+    ///
+    /// The `SPEECH_COREML_COMPUTE_UNITS` env override (applied by
+    /// `CoreMLLoader`) takes precedence over all of these.
     public static func fromPretrained(
         variant: SidonVariant = .fp16,
         modelId: String = defaultModelId,
         cacheDir: URL? = nil,
         offlineMode: Bool = false,
-        computeUnits: MLComputeUnits = .all,
+        computeUnits: MLComputeUnits? = nil,
+        predictorComputeUnits: MLComputeUnits? = nil,
+        vocoderComputeUnits: MLComputeUnits? = nil,
         progressHandler: ((Double, String) -> Void)? = nil
     ) async throws -> SpeechRestorer {
+        let placement = SidonComputePlacement.resolve(
+            computeUnits: computeUnits,
+            predictor: predictorComputeUnits,
+            vocoder: vocoderComputeUnits)
         progressHandler?(0.0, "Downloading model...")
 
         let paths = try await SidonDownloader.ensureDownloaded(
@@ -94,24 +114,34 @@ public final class SpeechRestorer {
             compiledName: SidonConfig.vocoderCompiledName,
             packageName: SidonConfig.vocoderPackageName)
 
-        let predictor = try SidonPredictorModel(modelURL: predictorURL, computeUnits: computeUnits)
-        let vocoder = try SidonVocoderModel(modelURL: vocoderURL, computeUnits: computeUnits)
+        let predictor = try SidonPredictorModel(
+            modelURL: predictorURL, computeUnits: placement.predictor)
+        let vocoder = try SidonVocoderModel(
+            modelURL: vocoderURL, computeUnits: placement.vocoder)
 
         progressHandler?(1.0, "Ready")
         return SpeechRestorer(
             predictor: predictor, vocoder: vocoder,
-            config: .default, variant: variant)
+            config: .default, variant: variant, placement: placement)
     }
 
     /// Load the two models directly from a local directory holding
     /// `Sidon-Predictor.{mlmodelc,mlpackage}` + `Sidon-Vocoder.{mlmodelc,mlpackage}`,
     /// skipping HuggingFace entirely. Useful for testing locally-converted
     /// artifacts (mirrors the other engines' local-bundle affordance).
+    ///
+    /// Compute-unit parameters behave exactly as in `fromPretrained`.
     public static func fromLocalBundle(
         directory: URL,
         variant: SidonVariant = .fp16,
-        computeUnits: MLComputeUnits = .all
+        computeUnits: MLComputeUnits? = nil,
+        predictorComputeUnits: MLComputeUnits? = nil,
+        vocoderComputeUnits: MLComputeUnits? = nil
     ) throws -> SpeechRestorer {
+        let placement = SidonComputePlacement.resolve(
+            computeUnits: computeUnits,
+            predictor: predictorComputeUnits,
+            vocoder: vocoderComputeUnits)
         let predictorURL = try SidonModelResolver.resolve(
             directory: directory,
             compiledName: SidonConfig.predictorCompiledName,
@@ -120,11 +150,13 @@ public final class SpeechRestorer {
             directory: directory,
             compiledName: SidonConfig.vocoderCompiledName,
             packageName: SidonConfig.vocoderPackageName)
-        let predictor = try SidonPredictorModel(modelURL: predictorURL, computeUnits: computeUnits)
-        let vocoder = try SidonVocoderModel(modelURL: vocoderURL, computeUnits: computeUnits)
+        let predictor = try SidonPredictorModel(
+            modelURL: predictorURL, computeUnits: placement.predictor)
+        let vocoder = try SidonVocoderModel(
+            modelURL: vocoderURL, computeUnits: placement.vocoder)
         return SpeechRestorer(
             predictor: predictor, vocoder: vocoder,
-            config: .default, variant: variant)
+            config: .default, variant: variant, placement: placement)
     }
 
     // MARK: - Window planning

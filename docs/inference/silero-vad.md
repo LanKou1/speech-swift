@@ -99,6 +99,8 @@ The `StreamingVADProcessor` wraps `SileroVADModel` with a four-state machine for
 - **speech** — Confirmed speech, `speechStarted` event emitted
 - **pendingSilence** — Offset crossed, waiting for `minSilenceDuration` before ending
 
+With a `TurnCompletionProvider` attached (`turnCompletion:` in the initializer), a confirmed silence is first checked by the classifier. A vetoed pause moves to a **held** state that keeps the segment open until speech resumes (same segment, no new `speechStarted`) or `TurnCompletionConfig.maxSilenceDuration` elapses. See [Smart Turn](smart-turn.md).
+
 ## Configuration
 
 ```swift

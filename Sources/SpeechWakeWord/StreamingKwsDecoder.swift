@@ -9,11 +9,44 @@ public struct KeywordDetection: Sendable, Equatable {
     /// Encoder frame indices the tokens were emitted at (40 ms / frame).
     public let timestamps: [Int]
     /// Encoder frame index at which the emission fired.
+    ///
+    /// This index is local to the decoder's current search epoch and can
+    /// restart after an automatic reset or a keyword emission. Use
+    /// ``streamFrameIndex`` for a position in a ``WakeWordSession`` stream.
     public let frameIndex: Int
+    /// Monotonic encoder-frame index in the enclosing ``WakeWordSession``.
+    ///
+    /// Direct ``StreamingKwsDecoder`` use has no session clock and leaves this
+    /// value nil.
+    public let streamFrameIndex: Int?
+    /// Session-relative encoder-frame indices for the matched BPE tokens.
+    /// Direct ``StreamingKwsDecoder`` use leaves this value nil.
+    public let streamTimestamps: [Int]?
 
-    /// Detection time in seconds, given a ``frameShiftSeconds``.
+    public init(
+        phrase: String,
+        tokenIds: [Int],
+        timestamps: [Int],
+        frameIndex: Int,
+        streamFrameIndex: Int? = nil,
+        streamTimestamps: [Int]? = nil
+    ) {
+        self.phrase = phrase
+        self.tokenIds = tokenIds
+        self.timestamps = timestamps
+        self.frameIndex = frameIndex
+        self.streamFrameIndex = streamFrameIndex
+        self.streamTimestamps = streamTimestamps
+    }
+
+    /// Decoder-local detection time in seconds, given a ``frameShiftSeconds``.
     public func time(frameShiftSeconds: Double) -> Double {
         Double(frameIndex) * frameShiftSeconds
+    }
+
+    /// Detection time relative to the start of the enclosing session.
+    public func streamTime(frameShiftSeconds: Double) -> Double? {
+        streamFrameIndex.map { Double($0) * frameShiftSeconds }
     }
 }
 
@@ -27,6 +60,18 @@ public struct KeywordDetection: Sendable, Equatable {
 public final class StreamingKwsDecoder {
     public typealias DecoderFn = ([Int]) -> [Float]
     public typealias JoinerFn = ([Float], [Float]) -> [Float]
+
+    /// One acoustic expansion considered for the next beam. ``insertionOrder``
+    /// freezes the old full-sort behavior for equal scores: candidates were
+    /// enumerated by hypothesis and then token, so an earlier candidate wins a
+    /// boundary tie deterministically.
+    struct Candidate: Equatable {
+        let totalLogProb: Double
+        let hypIndex: Int
+        let token: Int
+        let tokenProb: Double
+        let insertionOrder: Int
+    }
 
     public let contextGraph: ContextGraph
     public let blankId: Int
@@ -65,11 +110,20 @@ public final class StreamingKwsDecoder {
         self.blankId = blankId
         self.unkId = unkId ?? blankId
         self.contextSize = contextSize
-        self.beam = beam
+        // WakeWordDecodingOptions rejects out-of-range values before this
+        // lower-level decoder is built. Clamp direct construction as a final
+        // guard against pathological allocations or model-call counts.
+        self.beam = min(
+            max(beam, WakeWordDecodingOptions.supportedBeamRange.lowerBound),
+            WakeWordDecodingOptions.supportedBeamRange.upperBound
+        )
         self.numTrailingBlanks = numTrailingBlanks
         self.blankPenalty = blankPenalty
         self.frameShiftSeconds = frameShiftSeconds
-        self.autoResetFrames = max(1, Int((autoResetSeconds / frameShiftSeconds).rounded()))
+        self.autoResetFrames = Self.safeAutoResetFrameCount(
+            seconds: autoResetSeconds,
+            frameShiftSeconds: frameShiftSeconds
+        )
         reset()
     }
 
@@ -112,15 +166,15 @@ public final class StreamingKwsDecoder {
     public func step(encoderFrame: [Float]) -> [KeywordDetection] {
         var emissions: [KeywordDetection] = []
 
-        // Expand beam across candidate tokens.
-        struct Candidate {
-            let totalLogProb: Double
-            let hypIndex: Int
-            let token: Int
-            let tokenProb: Double
-        }
-        var candidates: [Candidate] = []
-        candidates.reserveCapacity(beamList.count * 32)
+        // Expand the beam while retaining only the global top B candidates.
+        // The former implementation materialized beam*vocab candidates and
+        // fully sorted them even though only B were consumed. With the shipped
+        // vocabulary that meant sorting up to 8,000 values per encoder frame
+        // at beam 16. This bounded list has identical ranking semantics and
+        // stores at most B values.
+        var topCandidates: [Candidate] = []
+        topCandidates.reserveCapacity(beam)
+        var insertionOrder = 0
 
         for (i, hyp) in beamList.enumerated() {
             let decOut = decoderFor(hyp.ys)
@@ -130,22 +184,23 @@ public final class StreamingKwsDecoder {
             }
             let (logProbs, probs) = Self.logSoftmax(logits)
             for token in 0..<logProbs.count {
-                candidates.append(
+                Self.retainTopCandidate(
                     Candidate(
                         totalLogProb: hyp.logProb + Double(logProbs[token]),
                         hypIndex: i,
                         token: token,
-                        tokenProb: Double(probs[token])
-                    )
+                        tokenProb: Double(probs[token]),
+                        insertionOrder: insertionOrder
+                    ),
+                    in: &topCandidates,
+                    limit: beam
                 )
+                insertionOrder += 1
             }
         }
 
-        candidates.sort { $0.totalLogProb > $1.totalLogProb }
-        let topK = candidates.prefix(beam)
-
         var nextBeam: [String: Hypothesis] = [:]
-        for cand in topK {
+        for cand in topCandidates {
             var hyp = beamList[cand.hypIndex]
             hyp.numTailingBlanks += 1
 
@@ -235,6 +290,58 @@ public final class StreamingKwsDecoder {
 
     // MARK: - helpers
 
+    /// Total ordering used by the bounded selector. Acoustic score remains the
+    /// primary key. The secondary key only resolves exact ties and preserves
+    /// the candidate enumeration order used by the previous full sort.
+    static func candidateRanksBefore(_ lhs: Candidate, _ rhs: Candidate) -> Bool {
+        if lhs.totalLogProb != rhs.totalLogProb {
+            return lhs.totalLogProb > rhs.totalLogProb
+        }
+        return lhs.insertionOrder < rhs.insertionOrder
+    }
+
+    /// Insert one value into an already-ranked bounded list. The list never
+    /// grows beyond ``limit`` and therefore avoids allocating or sorting the
+    /// discarded vocabulary expansions.
+    static func retainTopCandidate(
+        _ candidate: Candidate,
+        in candidates: inout [Candidate],
+        limit: Int
+    ) {
+        guard limit > 0 else { return }
+        if candidates.count == limit,
+           let last = candidates.last,
+           !candidateRanksBefore(candidate, last) {
+            return
+        }
+
+        var lower = 0
+        var upper = candidates.count
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if candidateRanksBefore(candidate, candidates[middle]) {
+                upper = middle
+            } else {
+                lower = middle + 1
+            }
+        }
+        candidates.insert(candidate, at: lower)
+        if candidates.count > limit {
+            candidates.removeLast()
+        }
+    }
+
+    /// Testable convenience that exercises the same streaming retention path
+    /// as ``step(encoderFrame:)`` without requiring Core ML models.
+    static func boundedTopCandidates(_ input: [Candidate], limit: Int) -> [Candidate] {
+        var result: [Candidate] = []
+        result.reserveCapacity(max(0, limit))
+        for candidate in input {
+            retainTopCandidate(candidate, in: &result, limit: limit)
+        }
+        return result
+    }
+
     private func decoderFor(_ ys: [Int]) -> [Float] {
         let ctx = Array(ys.suffix(contextSize))
         if let cached = decCache[ctx] { return cached }
@@ -248,6 +355,25 @@ public final class StreamingKwsDecoder {
         if b == -Double.infinity { return a }
         let m = max(a, b)
         return m + log1p(exp(-abs(a - b)))
+    }
+
+    /// Convert a duration to frames without allowing a finite but enormous
+    /// Double to trap during Int conversion. Session-facing options are
+    /// rejected above the documented maximum; this saturation protects direct
+    /// construction of the lower-level decoder as well.
+    static func safeAutoResetFrameCount(
+        seconds: Double,
+        frameShiftSeconds: Double
+    ) -> Int {
+        guard seconds.isFinite, seconds > 0,
+              frameShiftSeconds.isFinite, frameShiftSeconds > 0 else {
+            return 1
+        }
+        let rounded = (seconds / frameShiftSeconds).rounded()
+        guard rounded.isFinite, rounded < Double(Int.max) else {
+            return Int.max
+        }
+        return max(1, Int(rounded))
     }
 
     static func logSoftmax(_ logits: [Float]) -> (log: [Float], prob: [Float]) {

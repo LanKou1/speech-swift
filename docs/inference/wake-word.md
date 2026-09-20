@@ -24,7 +24,7 @@ let detector = try await WakeWordDetector.fromPretrained(
 let session = try detector.createSession()
 for chunk in audioStream {                         // Float32 @ 16 kHz
     for detection in try session.pushAudio(chunk) {
-        print("[\(detection.time(frameShiftSeconds: 0.04))s] \(detection.phrase)")
+        print("[\(detection.streamTime(frameShiftSeconds: 0.04) ?? 0)s] \(detection.phrase)")
     }
 }
 // Flush whatever's buffered when the stream ends:
@@ -33,6 +33,23 @@ for detection in try session.finalize() { print(detection.phrase) }
 // Batch — one-shot detection over a full file.
 let detections = try detector.detect(audio: samples, sampleRate: 16000)
 ```
+
+Search controls can be tuned per stream without reloading the models:
+
+```swift
+let options = WakeWordDecodingOptions(
+    beam: 8,
+    numTrailingBlanks: 3,
+    autoResetSeconds: 10
+)
+let session = try detector.createSession(options: options)
+```
+
+`beam` must be within `WakeWordDecodingOptions.supportedBeamRange` (`1...32`).
+`autoResetSeconds` must be positive and no greater than
+`WakeWordDecodingOptions.maximumAutoResetSeconds` (one hour). Invalid values
+are rejected when the session is created rather than being allowed to allocate
+an impractical search or overflow the decoder's frame counter.
 
 `KeywordSpec` fields:
 
@@ -48,8 +65,15 @@ let detections = try detector.detect(audio: samples, sampleRate: 16000)
 
 - `phrase` — the matching `KeywordSpec.phrase`.
 - `tokenIds` / `timestamps` — BPE ids and their encoder-frame offsets inside
-  the emission.
-- `frameIndex` — encoder frame at which the emission fired (40 ms / frame).
+  the decoder's current search epoch.
+- `frameIndex` — decoder-local encoder frame at which the emission fired
+  (40 ms / frame). It restarts after decoder auto-reset and keyword emission.
+- `streamTimestamps` — optional session-relative frame indices for the matched
+  BPE tokens. The final value marks the keyword's acoustic boundary, before
+  the trailing blanks used to confirm it.
+- `streamFrameIndex` — optional monotonically increasing detection frame in a
+  `WakeWordSession`. It restarts only when `WakeWordSession.reset()` is called.
+  Direct `StreamingKwsDecoder` use leaves both stream-relative fields nil.
 
 ## CLI
 
@@ -62,6 +86,10 @@ speech wake recording.wav --keywords "hey soniqo:0.1:0.5" "cancel:0.2"
 
 # JSON output:
 speech wake recording.wav --keywords "hey soniqo" --json
+
+# Wider search for a longer or unusual phrase:
+speech wake recording.wav --keywords "hey soniqo" \
+  --beam 8 --trailing-blanks 3 --auto-reset-seconds 10
 
 # Keyword file (one entry per line, `#` for comments):
 speech wake recording.wav --keywords-file keywords.txt

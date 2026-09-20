@@ -1,4 +1,5 @@
 import XCTest
+import CoreML
 @testable import SpeechRestoration
 
 /// Unit tests for Sidon config + variant wiring (no model download).
@@ -40,5 +41,46 @@ final class SpeechRestorationConfigTests: XCTestCase {
         XCTAssertEqual(SpeechRestorer.inputSampleRate, 16_000)
         XCTAssertEqual(SpeechRestorer.outputSampleRate, 48_000)
         XCTAssertEqual(SpeechRestorer.defaultModelId, "aufklarer/Sidon-CoreML")
+    }
+
+    // MARK: - Compute placement
+
+    /// The vocoder must never default to a Neural-Engine-eligible unit: its ANE
+    /// compile takes minutes and can fail (issue #464). The predictor may.
+    func testDefaultPlacementKeepsVocoderOffTheNeuralEngine() {
+        let p = SidonComputePlacement.default
+        XCTAssertEqual(p.predictor, .all)
+        XCTAssertEqual(p.vocoder, .cpuAndGPU)
+        XCTAssertEqual(SidonComputePlacement.defaultVocoder, .cpuAndGPU)
+        XCTAssertEqual(
+            SidonComputePlacement.resolve(computeUnits: nil, predictor: nil, vocoder: nil), p,
+            "no parameters must resolve to the shipped defaults")
+    }
+
+    func testUniformComputeUnitsApplyToBothStages() {
+        let p = SidonComputePlacement.resolve(computeUnits: .cpuOnly, predictor: nil, vocoder: nil)
+        XCTAssertEqual(p, .uniform(.cpuOnly))
+        XCTAssertEqual(p.predictor, .cpuOnly)
+        XCTAssertEqual(p.vocoder, .cpuOnly)
+    }
+
+    func testPerStageOverridesWinOverUniform() {
+        let p = SidonComputePlacement.resolve(
+            computeUnits: .cpuOnly, predictor: .cpuAndNeuralEngine, vocoder: nil)
+        XCTAssertEqual(p.predictor, .cpuAndNeuralEngine)
+        XCTAssertEqual(p.vocoder, .cpuOnly)
+
+        let q = SidonComputePlacement.resolve(computeUnits: nil, predictor: nil, vocoder: .all)
+        XCTAssertEqual(q.predictor, .all, "unset stage keeps its default")
+        XCTAssertEqual(q.vocoder, .all, "explicit opt-in to ANE for the vocoder is allowed")
+    }
+
+    func testRestorerRecordsPlacement() {
+        let r = SpeechRestorer(
+            predictor: nil, vocoder: nil, config: .default, variant: .fp16,
+            placement: .uniform(.cpuAndGPU), loaded: false)
+        XCTAssertEqual(r.placement, .uniform(.cpuAndGPU))
+        let d = SpeechRestorer(predictor: nil, vocoder: nil, config: .default, variant: .fp16)
+        XCTAssertEqual(d.placement, .default)
     }
 }

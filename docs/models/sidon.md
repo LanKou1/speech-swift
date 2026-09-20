@@ -85,14 +85,24 @@ compiling a `.mlpackage` on device (cached next to the package so the slow compi
 runs once per install). `SpeechRestorer.fromLocalBundle(directory:)` loads
 locally-converted artifacts directly, skipping HuggingFace.
 
-## Performance (M-series)
+## Performance (M5 Pro, macOS 26.5, fp16)
 
-Single 10 s window, Core ML `.all` compute units:
+Per stage, one 10 s window, fresh process (Metal shader cache warm):
 
-| | Wall | Notes |
-|---|---|---|
-| First window | slower | on-device `.mlpackage` compile (if no precompiled bundle) + cold load |
-| Subsequent windows | ~2 s | faster than realtime for the 10 s window |
+| Stage | Units | Load | First window | Steady |
+|---|---|---|---|---|
+| Predictor | `.all` (default) | 3.3 s | 0.28 s | 0.06 s |
+| Predictor | `.cpuAndGPU` | 0.4 s | 1.5 s | 0.06 s |
+| Vocoder | `.cpuAndGPU` (default) | 0.3 s | 0.2 s | 0.16 s |
+| Vocoder | `.cpuOnly` | 0.07 s | 0.7 s | 0.7 s |
+| Vocoder | `.cpuAndNeuralEngine` | **159 s, `ANECCompile() FAILED`** | 8.3 s (fallback) | 8 s |
+
+The pipeline is ~40× faster than realtime on the default placement. The vocoder
+row is why it is placed on the GPU: the DAC decoder's last stages are 1-D
+convolutions over `[1, 48, 479014]` tensors, and the Neural Engine compiler's
+spatial tiling of them takes minutes and can fail (see
+`docs/inference/sidon.md`, "Compute placement"). The `.mlpackage → .mlmodelc`
+compile is ~0.1 s and is not the cost.
 
 Validated against the Python Core ML reference: waveform cosine ≈ 0.9994 (fp16)
 and ≈ 0.9990 (int8) on the benchmark clip (neural-vocoder phase noise keeps this

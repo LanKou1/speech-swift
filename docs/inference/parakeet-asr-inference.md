@@ -27,6 +27,11 @@ Token-and-Duration Transducer (TDT) decoding interprets the encoder output. Unli
 
 Greedy decoding selects the highest-probability token and duration at each step. No beam search or language model rescoring is applied.
 
+The vocabulary classifies angle-bracket entries as model-control tokens and omits them from the
+returned transcript without suppressing them during decoding. Ordinary tokens are not classified
+by ID range, so model-emitted digits `0`–`9` are preserved even though their IDs sit between
+control-token ranges. Hidden control tokens still update the recurrent decoder state.
+
 ### 4. Confidence Score
 
 The pipeline returns an overall confidence score (0.0 to 1.0) computed as the sigmoid-scaled mean of token logits. This provides a rough estimate of transcription reliability — useful for deciding whether to retry with a different model or prompt the user.

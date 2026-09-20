@@ -131,6 +131,9 @@ public class StreamingSession {
         argmaxBuf.deallocate()
     }
 
+    /// Sample rate accepted by the incremental session.
+    public var inputSampleRate: Int { config.sampleRate }
+
     // MARK: - Push Audio
 
     /// Push a chunk of audio samples and get any new partial transcripts.
@@ -445,5 +448,33 @@ public class StreamingSession {
                    (targetLength - actualLength) * stride)
         }
         return padded
+    }
+}
+
+extension StreamingSession: StreamingRecognitionSession {
+    public func push(_ chunk: CapturedAudioChunk) throws -> [StreamingRecognitionUpdate] {
+        guard chunk.sampleRate == inputSampleRate else {
+            throw StreamingRecognitionError.sampleRateMismatch(
+                expected: inputSampleRate, actual: chunk.sampleRate)
+        }
+        return try pushAudio(chunk.samples).map {
+            StreamingRecognitionUpdate(
+                text: $0.text,
+                isFinal: $0.isFinal,
+                endOfUtterance: $0.eouDetected,
+                segmentIndex: $0.segmentIndex,
+                confidence: $0.confidence)
+        }
+    }
+
+    public func finish() throws -> [StreamingRecognitionUpdate] {
+        try finalize().map {
+            StreamingRecognitionUpdate(
+                text: $0.text,
+                isFinal: $0.isFinal,
+                endOfUtterance: $0.eouDetected,
+                segmentIndex: $0.segmentIndex,
+                confidence: $0.confidence)
+        }
     }
 }

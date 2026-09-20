@@ -16,10 +16,25 @@ public struct CapturedAudioChunk: Sendable, Equatable {
     /// Mach host-clock time for the first captured input frame, when valid.
     public let hostTime: UInt64?
 
-    public init(samples: [Float], sampleRate: Int, hostTime: UInt64?) {
+    /// Zero-based index of the first sample in the source stream.
+    /// Live sources may leave this at zero when they do not track an offset.
+    public let frameIndex: Int64
+
+    /// True when this is the last chunk from a finite source.
+    public let isFinal: Bool
+
+    public init(
+        samples: [Float],
+        sampleRate: Int,
+        hostTime: UInt64?,
+        frameIndex: Int64 = 0,
+        isFinal: Bool = false
+    ) {
         self.samples = samples
         self.sampleRate = sampleRate
         self.hostTime = hostTime
+        self.frameIndex = frameIndex
+        self.isFinal = isFinal
     }
 }
 
@@ -204,6 +219,96 @@ public extension SpeechRecognitionModel {
     }
 }
 
+// MARK: - Streaming Speech Recognition
+
+/// One incremental result emitted by a streaming speech-recognition session.
+public struct StreamingRecognitionUpdate: Sendable, Equatable {
+    /// Current transcript for this segment.
+    public let text: String
+    /// True once the transcript is committed and will no longer change.
+    public let isFinal: Bool
+    /// True when the recognizer or an external turn detector closed the turn.
+    public let endOfUtterance: Bool
+    /// Monotonically increasing segment index within the session.
+    public let segmentIndex: Int
+    /// Confidence in `[0, 1]`, when supplied by the recognizer.
+    public let confidence: Float
+    /// Detected or configured language, when supplied by the recognizer.
+    public let language: String?
+    /// Optional segment boundaries in seconds of session audio.
+    public let startTime: Double?
+    public let endTime: Double?
+    /// Optional cumulative or segment-local word timings.
+    public let words: [TimedWord]
+
+    public init(
+        text: String,
+        isFinal: Bool,
+        endOfUtterance: Bool = false,
+        segmentIndex: Int,
+        confidence: Float = 0,
+        language: String? = nil,
+        startTime: Double? = nil,
+        endTime: Double? = nil,
+        words: [TimedWord] = []
+    ) {
+        self.text = text
+        self.isFinal = isFinal
+        self.endOfUtterance = endOfUtterance
+        self.segmentIndex = segmentIndex
+        self.confidence = confidence
+        self.language = language
+        self.startTime = startTime
+        self.endTime = endTime
+        self.words = words
+    }
+}
+
+/// Errors shared by streaming recognizer adapters.
+public enum StreamingRecognitionError: Error, LocalizedError, Equatable {
+    case sampleRateMismatch(expected: Int, actual: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .sampleRateMismatch(let expected, let actual):
+            return "Streaming recognizer expects \(expected) Hz audio, received \(actual) Hz"
+        }
+    }
+}
+
+/// A stateful recognition session that consumes audio without reprocessing
+/// earlier chunks. Calls must be serialized by the consumer.
+public protocol StreamingRecognitionSession: AnyObject {
+    /// Sample rate expected by ``push(_:)``.
+    var inputSampleRate: Int { get }
+    /// Consume the next timestamped chunk and return any new partial/final text.
+    func push(_ chunk: CapturedAudioChunk) throws -> [StreamingRecognitionUpdate]
+    /// Drain buffered audio at the end of input.
+    func finish() throws -> [StreamingRecognitionUpdate]
+}
+
+public extension StreamingRecognitionSession {
+    /// Convenience for sources that do not carry capture timestamps.
+    func push(
+        samples: [Float],
+        sampleRate: Int,
+        frameIndex: Int64 = 0,
+        isFinal: Bool = false
+    ) throws -> [StreamingRecognitionUpdate] {
+        try push(CapturedAudioChunk(
+            samples: samples,
+            sampleRate: sampleRate,
+            hostTime: nil,
+            frameIndex: frameIndex,
+            isFinal: isFinal))
+    }
+}
+
+/// A loaded model capable of creating independent incremental sessions.
+public protocol StreamingRecognitionModel: AnyObject {
+    func makeStreamingSession(language: String?) throws -> any StreamingRecognitionSession
+}
+
 // MARK: - Forced Alignment
 
 /// A model that aligns text to audio at the word level.
@@ -262,6 +367,18 @@ public protocol StreamingVADProvider: AnyObject {
     func processChunk(_ samples: [Float]) -> Float
     /// Reset internal state (LSTM hidden state, context buffer, etc.)
     func resetState()
+}
+
+/// Decides whether the user has finished their turn once the VAD reports a pause.
+///
+/// A VAD only hears silence; a turn-completion model listens to the prosody of
+/// the whole utterance, so a mid-sentence pause keeps the agent waiting while a
+/// finished sentence gets an immediate reply. Maps to speech-core's
+/// `sc_turn_completion_vtable_t`.
+public protocol TurnCompletionProvider: AnyObject {
+    /// Probability in `[0, 1]` that the turn is complete, given the audio of the
+    /// turn so far. Implementations look at the most recent seconds (Smart Turn: 8 s).
+    func turnCompleteProbability(audio: [Float], sampleRate: Int) throws -> Float
 }
 
 // MARK: - Speaker Diarization

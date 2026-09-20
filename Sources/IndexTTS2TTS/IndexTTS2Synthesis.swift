@@ -19,11 +19,18 @@ public struct IndexTTS2SynthesisOptions: Equatable, Sendable {
     public var speakingRate: Float
     public var maxInternalPauseDuration: Float?
     public var s2MelSteps: Int
+    /// Longest text-token run generated in one pass; longer inputs are split
+    /// at punctuation and synthesized segment by segment, as upstream does.
+    public var maxTextTokensPerSegment: Int
+    /// Silence inserted between segments, in seconds (upstream: 0.2).
+    public var segmentIntervalSilence: Float
 
     public init(
         speakingRate: Float = 1.0,
         maxInternalPauseDuration: Float? = nil,
-        s2MelSteps: Int = 15
+        s2MelSteps: Int = 15,
+        maxTextTokensPerSegment: Int = 120,
+        segmentIntervalSilence: Float = 0.2
     ) throws {
         guard speakingRate.isFinite, speakingRate >= 0.5, speakingRate <= 1.5 else {
             throw AudioModelError.invalidConfiguration(
@@ -44,9 +51,21 @@ public struct IndexTTS2SynthesisOptions: Equatable, Sendable {
                 model: "IndexTTS2",
                 reason: "s2MelSteps must be in [4, 100].")
         }
+        guard maxTextTokensPerSegment >= 8, maxTextTokensPerSegment <= 600 else {
+            throw AudioModelError.invalidConfiguration(
+                model: "IndexTTS2",
+                reason: "maxTextTokensPerSegment must be in [8, 600].")
+        }
+        guard segmentIntervalSilence.isFinite, segmentIntervalSilence >= 0, segmentIntervalSilence <= 2.0 else {
+            throw AudioModelError.invalidConfiguration(
+                model: "IndexTTS2",
+                reason: "segmentIntervalSilence must be finite and in [0, 2.0].")
+        }
         self.speakingRate = speakingRate
         self.maxInternalPauseDuration = maxInternalPauseDuration
         self.s2MelSteps = s2MelSteps
+        self.maxTextTokensPerSegment = maxTextTokensPerSegment
+        self.segmentIntervalSilence = segmentIntervalSilence
     }
 
     public static let `default` = try! IndexTTS2SynthesisOptions()
@@ -138,6 +157,50 @@ enum IndexTTS2PauseCompressor {
 }
 
 extension IndexTTS2NativeRuntime {
+    /// Synthesizes `tokens` segment by segment (see `IndexTTS2TextSegmenter`)
+    /// and joins the pieces with `segmentIntervalSilence`, capped by
+    /// `maxInternalPauseDuration` when that is set.
+    func synthesizeSegments(
+        tokens: [IndexTTS2Token],
+        sampleRate: Int,
+        conditioning: IndexTTS2ReferenceConditioning,
+        semanticOptions: IndexTTS2SemanticGenerationOptions = IndexTTS2SemanticGenerationOptions(),
+        synthesisOptions: IndexTTS2SynthesisOptions = .default,
+        progressHandler: ((Double, String) -> Void)? = nil
+    ) throws -> [Float] {
+        let segments = IndexTTS2TextSegmenter.split(
+            tokens, maxTokens: synthesisOptions.maxTextTokensPerSegment)
+        guard !segments.isEmpty else {
+            throw AudioModelError.inferenceFailed(
+                operation: "IndexTTS2 synthesis",
+                reason: "Text produced no tokens.")
+        }
+        var gap = synthesisOptions.segmentIntervalSilence
+        if let maxPause = synthesisOptions.maxInternalPauseDuration {
+            gap = min(gap, maxPause)
+        }
+        let silence = [Float](repeating: 0, count: Int(Float(sampleRate) * gap))
+
+        var output: [Float] = []
+        for (index, segment) in segments.enumerated() {
+            progressHandler?(
+                Double(index) / Double(segments.count),
+                "IndexTTS2 synthesizing segment \(index + 1)/\(segments.count)")
+            let audio = try synthesize(
+                textTokens: segment.map(\.id),
+                conditioning: conditioning,
+                semanticOptions: semanticOptions,
+                synthesisOptions: synthesisOptions)
+            if index > 0 { output.append(contentsOf: silence) }
+            output.append(contentsOf: audio)
+            // Each segment leaves its intermediates in the MLX buffer cache;
+            // release them so long inputs stay within a bounded footprint.
+            Memory.clearCache()
+        }
+        progressHandler?(1.0, "IndexTTS2 synthesis complete")
+        return output
+    }
+
     func synthesize(
         textTokens: [Int],
         conditioning: IndexTTS2ReferenceConditioning,

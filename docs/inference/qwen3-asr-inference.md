@@ -166,7 +166,23 @@ The 8× conv stride downsamples 3000 mel frames to up to 390 audio tokens. For s
 
 ### Swift consumer
 
-`CoreMLEncoder.encode(_:)` returns `(embeddings: MLXArray, outputLength: Int)`. `CoreMLASRModel.transcribe` uses `outputLength` directly as `numAudioTokens` when chunking the audio prefill into the decoder; this replaces the previous `ceil(realMelFrames / 8)` heuristic with the model-reported truth.
+`CoreMLEncoder.encode(_:)` returns `(embeddings: MLXArray, outputLength: Int)`. `CoreMLASRModel.transcribe` uses `outputLength` directly as `numAudioTokens` when chunking the audio prefill into the decoder; this replaces the previous `ceil(realMelFrames / 8)` heuristic with the model-reported truth. `outputLength` is clamped to the embeddings tensor's own token extent, so a re-export whose in-graph length formula outran its output tensor throws instead of handing callers an out-of-range index.
+
+### Consuming `audio_embeddings`
+
+`audio_embeddings` is **Float16**, and ANE may hand it back with padded row strides. Never read it with `assumingMemoryBound(to: Float.self)` — that walks the buffer at twice the real element stride, which both corrupts every value and runs off the end of the allocation at row 195 of 390 (~15 s of audio). Go through one of:
+
+| Entry point | Use when |
+|---|---|
+| `CoreMLTextDecoder.audioEmbeddingsToFloatArray(_:count:)` | Bulk: the whole audio run at once, for batched prefill. This is what `transcribeWithoutMLX` uses. |
+| `CoreMLTextDecoder.audioEmbeddingFromMultiArray(_:at:)` | A single row. |
+| `CoreMLEncoder.encode(_:)` (MLXArray overload) | The MLX path — `multiArrayToMLXArray` converts. |
+
+All three are dtype- and stride-aware and bounds-check against the tensor's real extent.
+
+### Which path is MLX-free
+
+Only `CoreMLASRModel.transcribeWithoutMLX(...)` (and its wrapper `transcribeBackgroundSafe(...)`) is free of MLXArray operations end to end, so it is the one that is safe under iOS background execution. `CoreMLASRModel.transcribe(...)` dispatches all three models through CoreML but still round-trips through MLXArray for mel extraction and encoder output, both of which evaluate on Metal.
 
 ### Why the rebuild
 
@@ -188,6 +204,14 @@ M5 Pro, 48 GB; LibriSpeech test-clean n=200; isolated per-engine. See [docs/benc
 Qwen3-ASR operates in batch mode only. The entire audio input is processed in a single forward pass — there is no streaming or partial transcription support. The audio encoder uses block attention over the full mel spectrogram, and the text decoder generates tokens autoregressively conditioned on the complete encoder output.
 
 For long-form audio (> 15 s) and real-time transcription use cases, use [`StreamingASR.transcribeStream(...)`](https://github.com/soniqo/speech-swift/blob/main/Sources/Qwen3ASR/StreamingASR.swift) — it VAD-segments the input at silence boundaries with a `maxSegmentDuration` force-split safety net (default 10 s), so each segment hits the greedy fast path instead of the slow-path escalation that batch `transcribe(...)` engages on inputs over `longInputThresholdSeconds` (default 15 s). Streaming also avoids the per-segment encoder peak that long batch inputs incur on memory-constrained devices.
+
+## Cooperative Cancellation
+
+`transcribeCheckingCancellation(audio:sampleRate:options:)` is the task-cancellation entry point for the MLX pipeline. It decodes exactly like `transcribe(audio:sampleRate:options:)` but checks Swift task cancellation before feature extraction, before the audio encoder, before decoder prefill, and before every decoder step on both the greedy and the repetition-aware paths. Once cancellation is observed at a checkpoint it throws `CancellationError` instead of returning a partial transcript.
+
+Cancellation latency is bounded by the MLX work already in flight — one encoder/prefill evaluation or one token step; Metal kernels cannot be preempted. The synchronous `transcribe(...)` overloads and `transcribeBatch(...)` retain their non-throwing behavior and are not task-cancellation entry points: a caller that transcribes inside an already-cancelled task still receives the full transcript.
+
+`speech-server` routes Qwen3-ASR requests through the cancellation-aware entry point, so cancelling the task running Qwen3-ASR transcription stops decoding at the next checkpoint instead of continuing to EOS. Disconnect handling must propagate cancellation to that task.
 
 ## Language Detection
 

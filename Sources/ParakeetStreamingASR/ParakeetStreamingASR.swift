@@ -233,3 +233,11 @@ public class ParakeetStreamingASRModel {
         return try MLModel(contentsOf: modelURL, configuration: mlConfig)
     }
 }
+
+extension ParakeetStreamingASRModel: StreamingRecognitionModel {
+    public func makeStreamingSession(
+        language _: String? = nil
+    ) throws -> any StreamingRecognitionSession {
+        try createSession()
+    }
+}

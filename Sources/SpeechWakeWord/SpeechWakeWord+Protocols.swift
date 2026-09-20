@@ -21,9 +21,12 @@ public final class WakeWordStreamingAdapter: WakeWordProvider {
     public let detector: WakeWordDetector
     private let session: WakeWordSession
 
-    public init(detector: WakeWordDetector) throws {
+    public init(
+        detector: WakeWordDetector,
+        options: WakeWordDecodingOptions = WakeWordDecodingOptions()
+    ) throws {
         self.detector = detector
-        self.session = try detector.createSession()
+        self.session = try detector.createSession(options: options)
     }
 
     public var inputSampleRate: Int { detector.config.feature.sampleRate }

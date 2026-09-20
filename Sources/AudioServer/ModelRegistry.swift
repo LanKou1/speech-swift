@@ -63,6 +63,8 @@ public struct ModelVariant: Sendable, Equatable {
         case separate
         /// Speech super-resolution (low-rate audio → high-rate audio).
         case sr
+        /// End-of-turn detection (audio → probability the speaker is done).
+        case turn
     }
 }
 
@@ -289,6 +291,13 @@ public let MODEL_REGISTRY: [ModelVariant] = [
           modelId: FireRedVADModel.defaultModelId,
           aliases: ["firered", "firered-vad"],
           kind: .vad),
+
+    // ─── Turn detection ────────────────────────────────────────────────────
+    .init(name: "smart-turn-v3.2-coreml",
+          engine: "smart-turn",
+          modelId: SmartTurnModel.defaultModelId,
+          aliases: ["smart-turn", "smartturn", "turn"],
+          kind: .turn),
 
     // ─── Diarization ───────────────────────────────────────────────────────
     .init(name: "sortformer-diarization-coreml",

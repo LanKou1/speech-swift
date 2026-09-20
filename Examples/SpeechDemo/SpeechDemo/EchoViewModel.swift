@@ -8,6 +8,24 @@ import SpeechCore
 import SpeechVAD
 import AudioCommon
 
+/// Wraps the Smart Turn model so each end-of-turn decision shows up in the log.
+/// The pipeline calls it on the audio thread, once per VAD pause.
+private final class LoggingTurnCompletion: TurnCompletionProvider {
+    private let model: SmartTurnModel
+    private let onDecision: (_ probability: Float, _ turnSeconds: Double) -> Void
+
+    init(model: SmartTurnModel, onDecision: @escaping (Float, Double) -> Void) {
+        self.model = model
+        self.onDecision = onDecision
+    }
+
+    func turnCompleteProbability(audio: [Float], sampleRate: Int) throws -> Float {
+        let probability = try model.turnCompleteProbability(audio: audio, sampleRate: sampleRate)
+        onDecision(probability, Double(audio.count) / Double(sampleRate))
+        return probability
+    }
+}
+
 @Observable
 @MainActor
 final class EchoViewModel {
@@ -20,10 +38,17 @@ final class EchoViewModel {
     var lastLanguage: String = ""
     var log: [String] = []
     var vadLevel: Float = 0
+    /// Confirm each VAD pause with Smart Turn before ending the user's turn, so a
+    /// mid-sentence pause does not trigger a reply. Read at `startPipeline()`.
+    var smartTurnEnabled = true
+    /// Most recent Smart Turn answer (probability that the turn was complete).
+    var lastTurnProbability: Float?
 
     private var vad: SileroVADModel?
     private var asr: ParakeetASRModel?
     private var tts: Qwen3TTSModel?
+    private var smartTurn: SmartTurnModel?
+    private var turnCompletion: LoggingTurnCompletion?
     private var pipeline: VoicePipeline?
     private var audioEngine: AVAudioEngine?
     private let player = StreamingAudioPlayer()
@@ -45,6 +70,20 @@ final class EchoViewModel {
             vad = try await Task.detached {
                 try await SileroVADModel.fromPretrained(engine: .coreml)
             }.value
+
+            // Smart Turn is optional (~17 MB). If it cannot be loaded the pipeline
+            // still runs and ends turns on VAD silence alone.
+            loadingStatus = "Loading Smart Turn (CoreML)..."
+            do {
+                smartTurn = try await Task.detached {
+                    let model = try await SmartTurnModel.fromPretrained()
+                    try model.prewarm()
+                    return model
+                }.value
+            } catch {
+                smartTurn = nil
+                appendLog("[Turn] Smart Turn unavailable, turns end on VAD silence: \(error.localizedDescription)")
+            }
 
             loadingStatus = "Loading ASR (Parakeet CoreML)..."
             asr = try await Task.detached {
@@ -94,6 +133,25 @@ final class EchoViewModel {
             }
         )
 
+        // End-of-turn classifier: a VAD pause only ends the turn once Smart Turn
+        // agrees (probability >= turnCompletionThreshold); otherwise the pipeline
+        // keeps listening until speech resumes or turnCompletionMaxSilence elapses.
+        lastTurnProbability = nil
+        turnCompletion = nil
+        if smartTurnEnabled, let smartTurn {
+            let threshold = config.turnCompletionThreshold
+            let logging = LoggingTurnCompletion(model: smartTurn) { [weak self] probability, seconds in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.lastTurnProbability = probability
+                    let verdict = probability >= threshold ? "complete" : "hold"
+                    self.appendLog("[Turn] p=\(String(format: "%.2f", probability)) \(verdict) after \(String(format: "%.1f", seconds))s of speech")
+                }
+            }
+            turnCompletion = logging
+            pipeline?.setTurnCompletion(logging)
+        }
+
         player.onPlaybackFinished = { [weak self] in
             guard let self, self.isRunning else { return }
             self.pipeline?.resumeListening()
@@ -106,7 +164,9 @@ final class EchoViewModel {
         debugMicBuffer = []
         debugTTSBuffer = []
         pipelineState = "listening"
-        appendLog("Pipeline started — speak into the mic...")
+        appendLog(turnCompletion != nil
+            ? "Pipeline started with Smart Turn — pauses are confirmed by the end-of-turn classifier..."
+            : "Pipeline started — speak into the mic...")
         startMicrophone()
     }
 
@@ -114,6 +174,7 @@ final class EchoViewModel {
         stopMicrophone()
         pipeline?.stop()
         pipeline = nil
+        turnCompletion = nil
         isRunning = false
         pipelineState = "idle"
         saveDebugFiles()
