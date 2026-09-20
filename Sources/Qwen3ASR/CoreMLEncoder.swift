@@ -250,7 +250,8 @@ extension Qwen3ASRModel {
             audioEmbeds: realEmbeds,
             textDecoder: textDecoder,
             language: language,
-            maxTokens: maxTokens
+            maxTokens: maxTokens,
+            checkCancellation: {}
         )
     }
 }

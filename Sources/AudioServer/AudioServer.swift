@@ -1658,7 +1658,9 @@ private func streamSamplesAsDeltas(
 ///
 /// Returns an empty string on engine-level errors (matching the WS path's
 /// `try?` shape) so the calling route can return an empty transcript
-/// rather than a 500.
+/// rather than a 500. Task cancellation is the exception: the Qwen3-ASR
+/// path throws `CancellationError` at its next decoder checkpoint so an
+/// abandoned request releases the GPU instead of decoding to EOS.
 func dispatchTranscribe(
     audio: [Float],
     sampleRate: Int,
@@ -1684,7 +1686,7 @@ func dispatchTranscribe(
         return (try? model.transcribeAudio(audio16k, sampleRate: 16000, language: language)) ?? ""
     case "qwen3-asr":
         let model = try await state.loadQwen3ASR(modelId: variant.modelId)
-        return model.transcribe(audio: audio16k, sampleRate: 16000)
+        return try model.transcribeCheckingCancellation(audio: audio16k, sampleRate: 16000)
     default:
         throw RealtimeDispatchError.engineNotEnabled(kind: "ASR", engine: variant.engine)
     }
