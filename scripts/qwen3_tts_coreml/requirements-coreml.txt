@@ -1,0 +1,8 @@
+# Python 3.11; export and inference require macOS 15+ on Apple Silicon.
+torch==2.10.0
+torchaudio==2.10.0
+coremltools==9.0
+qwen-tts==0.1.1
+transformers==4.57.3
+numpy==1.26.4
+pytest==8.4.2
