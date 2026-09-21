@@ -82,6 +82,45 @@ extension Qwen3TTSModel {
         codecEncoder: SpeechTokenizerEncoder,
         trimReference: Bool = true
     ) -> [Float] {
+        synthesizeWithVoiceCloneICL(
+            text: text, referenceAudio: referenceAudio,
+            referenceSampleRate: referenceSampleRate, referenceText: referenceText,
+            language: language, sampling: sampling, codecEncoder: codecEncoder,
+            trimReference: trimReference, checkCancellation: {})
+    }
+
+    /// Cancellation-aware ICL cloning. Checks cancellation between MLX stages
+    /// and within autoregressive generation; an executing GPU kernel may finish.
+    public func synthesizeWithVoiceCloneICLCancellable(
+        text: String,
+        referenceAudio: [Float],
+        referenceSampleRate: Int = 24000,
+        referenceText: String,
+        language: String = "auto",
+        sampling: SamplingConfig = .default,
+        codecEncoder: SpeechTokenizerEncoder,
+        trimReference: Bool = true
+    ) throws -> [Float] {
+        try synthesizeWithVoiceCloneICL(
+            text: text, referenceAudio: referenceAudio,
+            referenceSampleRate: referenceSampleRate, referenceText: referenceText,
+            language: language, sampling: sampling, codecEncoder: codecEncoder,
+            trimReference: trimReference,
+            checkCancellation: { try Task.checkCancellation() })
+    }
+
+    private func synthesizeWithVoiceCloneICL(
+        text: String,
+        referenceAudio: [Float],
+        referenceSampleRate: Int = 24000,
+        referenceText: String,
+        language: String = "auto",
+        sampling: SamplingConfig = .default,
+        codecEncoder: SpeechTokenizerEncoder,
+        trimReference: Bool = true,
+        checkCancellation: () throws -> Void
+    ) rethrows -> [Float] {
+        try checkCancellation()
         guard let tokenizer = tokenizer else {
             fatalError("Tokenizer not loaded")
         }
@@ -97,12 +136,12 @@ extension Qwen3TTSModel {
         } else {
             AudioLog.inference.warning(
                 "Unknown language '\(language, privacy: .private)', falling back to auto")
-            return synthesizeWithVoiceCloneICL(
+            return try synthesizeWithVoiceCloneICL(
                 text: text, referenceAudio: referenceAudio,
                 referenceSampleRate: referenceSampleRate,
                 referenceText: referenceText, language: "auto",
                 sampling: sampling, codecEncoder: codecEncoder,
-                trimReference: trimReference)
+                trimReference: trimReference, checkCancellation: checkCancellation)
         }
 
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -117,13 +156,17 @@ extension Qwen3TTSModel {
             let audio24k = referenceSampleRate == 24000
                 ? referenceAudio
                 : AudioFileLoader.resample(referenceAudio, from: referenceSampleRate, to: 24000)
+            try checkCancellation()
             let codes = codecEncoder.encode(samples: audio24k)
             eval(codes)
+            try checkCancellation()
             referenceAudioCache.storeCodecRefCodes(codes, audio: referenceAudio, sampleRate: referenceSampleRate)
             refCodes = codes
             AudioLog.inference.debug(
                 "ICL: encoded \(audio24k.count, privacy: .public) samples → \(codes.dim(2), privacy: .public) codec frames")
         }
+
+        try checkCancellation()
 
         // Step 3: Extract speaker embedding (ICL still uses x-vector for speaker conditioning; cached)
         let speakerEmbed: MLXArray
@@ -131,11 +174,15 @@ extension Qwen3TTSModel {
             speakerEmbed = cached
         } else {
             let mels = SpeakerMel.compute(audio: referenceAudio, sampleRate: referenceSampleRate)
+            try checkCancellation()
             let embed = speakerEncoder(mels)  // [1, 1024]
             eval(embed)
+            try checkCancellation()
             referenceAudioCache.storeSpeakerEmbed(embed, audio: referenceAudio, sampleRate: referenceSampleRate)
             speakerEmbed = embed
         }
+
+        try checkCancellation()
 
         // Step 4: Build ICL prefill embeddings
         let (prefillEmbeds, trailingTextHidden, ttsPadEmbed) = buildICLPrefillEmbeddings(
@@ -148,6 +195,7 @@ extension Qwen3TTSModel {
             tokenizer: tokenizer)
 
         eval(prefillEmbeds, trailingTextHidden, ttsPadEmbed)
+        try checkCancellation()
         let t1 = CFAbsoluteTimeGetCurrent()
 
         // Step 5: Autoregressive generation. Auto-bump repetition_penalty to
@@ -167,13 +215,15 @@ extension Qwen3TTSModel {
         let targetTokenCount = tokenizer.encode(text).count
         let textDerivedCap = max(96, targetTokenCount * 8)
         iclSampling.maxTokens = min(iclSampling.maxTokens, textDerivedCap)
-        let (allCodebooks, numFrames) = generateWithCodePredictor(
+        let (allCodebooks, numFrames) = try generateWithCodePredictor(
             prefillEmbeds: prefillEmbeds,
             trailingTextHidden: trailingTextHidden,
             ttsPadEmbed: ttsPadEmbed,
-            sampling: iclSampling)
+            sampling: iclSampling,
+            checkCancellation: checkCancellation)
 
         eval(allCodebooks)
+        try checkCancellation()
         let t2 = CFAbsoluteTimeGetCurrent()
 
         guard numFrames > 0 else {
@@ -197,7 +247,10 @@ extension Qwen3TTSModel {
         let totalFrames = codesForDecode.dim(2)
         AudioLog.inference.debug(
             "ICL: decoding \(numFrames, privacy: .public) target frames (+ \(trimReference ? refFrames : 0, privacy: .public) ref ctx) → \(totalFrames, privacy: .public) frames")
-        let fullWaveform = codecDecoder.decode(codes: codesForDecode)
+        try checkCancellation()
+        let fullWaveform = try codecDecoder.decode(
+            codes: codesForDecode, checkCancellation: checkCancellation)
+        try checkCancellation()
         let t3 = CFAbsoluteTimeGetCurrent()
 
         let trimmedWaveform: [Float]
@@ -222,6 +275,7 @@ extension Qwen3TTSModel {
         AudioLog.inference.info(
             "ICL timing: encode=\(encTime, privacy: .public)s | generate=\(genTime, privacy: .public)s (\(numFrames, privacy: .public) steps, \(msPerStep, privacy: .public)ms/step) | decode=\(decTime, privacy: .public)s | total=\(totTime, privacy: .public)s | audio=\(audDur, privacy: .public)s | RTF=\(rtf, privacy: .public)")
 
+        try checkCancellation()
         return trimmedWaveform
     }
 
@@ -283,34 +337,18 @@ extension Qwen3TTSModel {
         let codecEmbedICL = concatenated([codecBosEmbed, refCodecEmbed], axis: 1)  // [1, T_ref+1, D]
         let codecLens = codecEmbedICL.dim(1)
 
-        // 5. Streaming overlay — matches the qwen-tts reference default
-        // (generate_icl_prompt, non_streaming_mode=False). Align the text with the
-        // reference codec ELEMENT-WISE (sum) instead of concatenating them, and feed
-        // any text beyond the codec length as trailing.
-        //
-        // The model still re-speaks the reference before the target (the trim below
-        // is still required), but with this overlay the reproduction is ~ the
-        // reference's own frame count and far more consistent run-to-run, instead of
-        // the longer, highly variable reproduction the non-streaming layout (text
-        // block, then codec block) produced. That variability is what defeated the
-        // token-ratio trim and leaked seconds of reference echo into the output
-        // (failing the grader's prefix check → seed-ladder retries). With the
-        // overlay + frame-based trim, takes come out clean often enough that the
-        // seed ladder reliably lands a clean one, and ~30-40% fewer frames are
-        // generated per take.
-        let iclInputEmbed: MLXArray
-        let iclTrailing: MLXArray
-        if textLens > codecLens {
-            iclInputEmbed = textEmbedWithEos[0..., 0..<codecLens, 0...] + codecEmbedICL
-            iclTrailing = textEmbedWithEos[0..., codecLens..., 0...]
-        } else {
-            let padLen = codecLens - textLens
-            let paddedText = padLen > 0
-                ? concatenated([textEmbedWithEos, broadcast(ttsPadEmbed, to: [1, padLen, hiddenSize])], axis: 1)
-                : textEmbedWithEos
-            iclInputEmbed = paddedText + codecEmbedICL
-            iclTrailing = ttsPadEmbed
-        }
+        // 5. Non-streaming ICL layout, matching mlx-audio 0.5.4:
+        // all reference + target text over codec_pad, followed by reference
+        // codec over tts_pad. Keep the complete text context in the prefill
+        // instead of element-wise alignment with the reference codec frames.
+        let codecPadEmbed = talker.embedCodec(
+            MLXArray([Int32(CodecTokens.codecPad)]).expandedDimensions(axis: 0))
+        let textWithCodecPad = textEmbedWithEos
+            + broadcast(codecPadEmbed, to: [1, textLens, hiddenSize])
+        let codecWithTextPad = codecEmbedICL
+            + broadcast(ttsPadEmbed, to: [1, codecLens, hiddenSize])
+        let iclInputEmbed = concatenated([textWithCodecPad, codecWithTextPad], axis: 1)
+        let iclTrailing = ttsPadEmbed
 
         // 6. Codec prefix. Two layouts (reference parity):
         //   With language id: [codec_think, codec_think_bos, lang_id, codec_think_eos, pad, bos]
@@ -369,8 +407,7 @@ extension Qwen3TTSModel {
         let inputEmbeds = concatenated(
             [roleEmbed, combinedPrefixOverlay, iclInputEmbed], axis: 1)
 
-        // Trailing text: leftover target text (streaming) or tts_pad. The generation
-        // loop feeds this one token per step so the model produces the target codec.
+        // All text is in the non-streaming prefill; generation receives tts_pad.
         return (inputEmbeds, iclTrailing, ttsPadEmbed)
     }
 }

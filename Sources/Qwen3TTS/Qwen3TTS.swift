@@ -1588,7 +1588,7 @@ public class Qwen3TTSModel {
             checkCancellation: {})
     }
 
-    private func generateWithCodePredictor(
+    func generateWithCodePredictor(
         prefillEmbeds: MLXArray,
         trailingTextHidden: MLXArray,
         ttsPadEmbed: MLXArray,

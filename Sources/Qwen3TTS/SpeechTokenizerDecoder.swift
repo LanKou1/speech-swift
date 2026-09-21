@@ -694,12 +694,29 @@ public class SpeechTokenizerDecoder: Module {
     /// Only the last `chunkSize * samplesPerFrame` samples are kept (overlap is trimmed).
     /// All convolutions are causal (left-padded), so chunks produce correct output with left context.
     public func chunkedDecode(codes: MLXArray, chunkSize: Int = 25, leftContext: Int = 10) -> MLXArray {
+        chunkedDecode(codes: codes, chunkSize: chunkSize, leftContext: leftContext,
+                      checkCancellation: {})
+    }
+
+    /// Decode with cooperative cancellation around each evaluated chunk.
+    /// Cancellation cannot interrupt an executing GPU kernel.
+    public func chunkedDecode(
+        codes: MLXArray,
+        chunkSize: Int = 25,
+        leftContext: Int = 10,
+        checkCancellation: () throws -> Void
+    ) rethrows -> MLXArray {
         let numFrames = codes.dim(2)  // [B, 16, T]
         let samplesPerFrame = 1920    // 24000 / 12.5
 
         if numFrames <= chunkSize + leftContext {
-            // Short enough to decode in one pass
-            return executeDecoder(codes)
+            // Short enough to decode in one pass. Evaluate before the second
+            // checkpoint so it observes cancellation during this actual chunk.
+            try checkCancellation()
+            let waveform = executeDecoder(codes)
+            eval(waveform)
+            try checkCancellation()
+            return waveform
         }
 
         var audioChunks: [MLXArray] = []
@@ -711,6 +728,7 @@ public class SpeechTokenizerDecoder: Module {
             let actualContext = offset - contextStart
 
             let chunkCodes = codes[0..., 0..., contextStart..<chunkEnd]  // [B, 16, contextFrames + chunkFrames]
+            try checkCancellation()
             let chunkWaveform = executeDecoder(chunkCodes)  // [B, T_samples, 1]
 
             // Trim left context samples — clamp to actual output length because
@@ -719,6 +737,8 @@ public class SpeechTokenizerDecoder: Module {
             let trimSamples = min(actualContext * samplesPerFrame, chunkWaveform.dim(1))
             let totalSamples = chunkWaveform.dim(1)
             guard trimSamples < totalSamples else {
+                eval(chunkWaveform)
+                try checkCancellation()
                 offset = chunkEnd
                 continue
             }
@@ -727,6 +747,7 @@ public class SpeechTokenizerDecoder: Module {
             // Eval each chunk to free intermediate decoder tensors (480x upsample).
             // Without this, all chunks' intermediates stay in memory as lazy graph nodes.
             eval(kept)
+            try checkCancellation()
 
             audioChunks.append(kept)
             offset = chunkEnd
@@ -737,10 +758,23 @@ public class SpeechTokenizerDecoder: Module {
 
     /// Convert codes to float audio samples using chunked decoding + bulk extraction
     public func decode(codes: MLXArray) -> [Float] {
-        let waveform = chunkedDecode(codes: codes)
+        decode(codes: codes, checkCancellation: {})
+    }
+
+    /// Convert codes to samples with cancellation checkpoints around every
+    /// decoder chunk and before returning the copied samples.
+    public func decode(
+        codes: MLXArray,
+        checkCancellation: () throws -> Void
+    ) rethrows -> [Float] {
+        try checkCancellation()
+        let waveform = try chunkedDecode(codes: codes, checkCancellation: checkCancellation)
         let flat = waveform.squeezed()
         eval(flat)
-        return flat.asArray(Float.self)
+        try checkCancellation()
+        let samples = flat.asArray(Float.self)
+        try checkCancellation()
+        return samples
     }
 
     /// Decode multiple items sequentially via existing `decode()`.
