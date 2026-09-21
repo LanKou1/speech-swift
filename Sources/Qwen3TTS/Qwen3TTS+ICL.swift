@@ -231,15 +231,9 @@ extension Qwen3TTSModel {
             return []
         }
 
-        // Step 6+7: Decode, prepending the reference codec, then cut the reference
-        // portion off the front (matches the qwen-tts reference decode path).
-        //
-        // The talker now generates the TARGET codec only (the encoder produces the
-        // correct reference codec, so the model continues past it instead of re-
-        // speaking it). The Mimi decoder is causal and needs left context, so we
-        // prepend the exact reference codec for the decode and then cut the leading
-        // `refFrames / totalFrames` fraction of audio — the part the reference
-        // codec produced — leaving clean target audio with no echo and no clipping.
+        // Decode with the reference codec as context, retaining Python's original
+        // 300-frame chunk boundaries and 25-frame left context. Skip only decoder
+        // chunks whose waveform would be removed by the reference-prefix trim.
         let refFrames = refCodes.dim(2)
         let codesForDecode = trimReference
             ? concatenated([refCodes, allCodebooks], axis: 2)   // [1, 16, refFrames + numFrames]
@@ -248,21 +242,12 @@ extension Qwen3TTSModel {
         AudioLog.inference.debug(
             "ICL: decoding \(numFrames, privacy: .public) target frames (+ \(trimReference ? refFrames : 0, privacy: .public) ref ctx) → \(totalFrames, privacy: .public) frames")
         try checkCancellation()
-        let fullWaveform = try codecDecoder.decode(
-            codes: codesForDecode, checkCancellation: checkCancellation)
+        let trimmedWaveform = try codecDecoder.decode(
+            codes: codesForDecode, chunkSize: 300, leftContext: 25,
+            startFrame: trimReference ? refFrames : 0,
+            checkCancellation: checkCancellation)
         try checkCancellation()
         let t3 = CFAbsoluteTimeGetCurrent()
-
-        let trimmedWaveform: [Float]
-        if trimReference && totalFrames > 0 {
-            let cut = refFrames * fullWaveform.count / totalFrames
-            trimmedWaveform = (cut > 0 && cut < fullWaveform.count)
-                ? Array(fullWaveform.dropFirst(cut)) : fullWaveform
-            AudioLog.inference.debug(
-                "ICL: cut \(cut, privacy: .public) reference samples (~\(String(format: "%.2f", Double(cut)/24000.0), privacy: .public)s, \(refFrames, privacy: .public)/\(totalFrames, privacy: .public) frames) from output start")
-        } else {
-            trimmedWaveform = fullWaveform
-        }
 
         let audioDur = Double(trimmedWaveform.count) / 24000.0
         let encTime = String(format: "%.3f", t1-t0)

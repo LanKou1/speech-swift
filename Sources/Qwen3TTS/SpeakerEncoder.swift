@@ -294,8 +294,15 @@ public enum SpeakerMel {
     private static func stftMagnitudes(
         samples: [Float], nFFT: Int, hopLength: Int, window: [Float]
     ) -> MLXArray {
+        // Zero-extend empty or sub-hop inputs before reflection padding so the
+        // padded signal contains at least one complete FFT window. Inputs of
+        // hopLength samples or more retain the reference feature calculation.
+        let samples = samples.count < hopLength
+            ? samples + [Float](repeating: 0, count: hopLength - samples.count)
+            : samples
         let numBins = nFFT / 2 + 1
-        let padAmount = nFFT / 2
+        // Match the reference center=False STFT with explicit reflection padding.
+        let padAmount = (nFFT - hopLength) / 2
         // Reflect pad
         var padded = [Float](repeating: 0, count: padAmount + samples.count + padAmount)
         for i in 0..<padAmount {
@@ -342,13 +349,13 @@ public enum SpeakerMel {
                         // Extract magnitudes: DC, bins 1..N/2-1, Nyquist
                         let dc = splitComplex.realp[0] / 2.0
                         let nyquist = splitComplex.imagp[0] / 2.0
-                        magnitudes[frame * numBins] = abs(dc)
+                        magnitudes[frame * numBins] = sqrt(dc * dc + 1e-9)
                         for bin in 1..<(nFFT / 2) {
                             let r = splitComplex.realp[bin] / 2.0
                             let im = splitComplex.imagp[bin] / 2.0
-                            magnitudes[frame * numBins + bin] = sqrt(r * r + im * im)
+                            magnitudes[frame * numBins + bin] = sqrt(r * r + im * im + 1e-9)
                         }
-                        magnitudes[frame * numBins + nFFT / 2] = abs(nyquist)
+                        magnitudes[frame * numBins + nFFT / 2] = sqrt(nyquist * nyquist + 1e-9)
                     }
                 }
             }
@@ -362,33 +369,37 @@ public enum SpeakerMel {
     ) -> MLXArray {
         let numBins = nFFT / 2 + 1
 
-        func hzToMel(_ hz: Float) -> Float { 2595.0 * log10(1.0 + hz / 700.0) }
-        func melToHz(_ mel: Float) -> Float { 700.0 * (pow(10.0, mel / 2595.0) - 1.0) }
-
-        let melMin = hzToMel(fMin)
-        let melMax = hzToMel(fMax)
-        let melPoints = (0...(nMels + 1)).map { i in
-            melToHz(melMin + Float(i) * (melMax - melMin) / Float(nMels + 1))
+        // Match mlx-audio's float32 Slaney filterbank, including area normalization.
+        // Scalar endpoints use Double as Python does before mx.linspace casts them.
+        func hzToMel(_ hz: Float) -> Double {
+            let frequency = Double(hz)
+            let linearSpacing = 200.0 / 3.0
+            let minLogMel = 1000.0 / linearSpacing
+            let logStep = Foundation.log(6.4) / 27.0
+            return frequency >= 1000.0
+                ? minLogMel + Foundation.log(frequency / 1000.0) / logStep
+                : frequency / linearSpacing
         }
 
-        let fftFreqs = (0..<numBins).map { Float($0) * Float(sampleRate) / Float(nFFT) }
-
-        var filterbank = [Float](repeating: 0, count: numBins * nMels)
-        for m in 0..<nMels {
-            let fLow = melPoints[m]
-            let fCenter = melPoints[m + 1]
-            let fHigh = melPoints[m + 2]
-
-            for k in 0..<numBins {
-                let freq = fftFreqs[k]
-                if freq >= fLow && freq <= fCenter && fCenter > fLow {
-                    filterbank[k * nMels + m] = (freq - fLow) / (fCenter - fLow)
-                } else if freq > fCenter && freq <= fHigh && fHigh > fCenter {
-                    filterbank[k * nMels + m] = (fHigh - freq) / (fHigh - fCenter)
-                }
-            }
-        }
-
-        return MLXArray(filterbank, [numBins, nMels])
+        let melPoints = MLX.linspace(
+            Float(hzToMel(fMin)), Float(hzToMel(fMax)), count: nMels + 2)
+            .asType(.float32)
+        let linearSpacing = Float(200.0 / 3.0)
+        let minLogMel = Float(1000.0 / (200.0 / 3.0))
+        let logStep = Float(Foundation.log(6.4) / 27.0)
+        let frequencyPoints = MLX.where(
+            melPoints .>= minLogMel,
+            1000.0 * exp(logStep * (melPoints - minLogMel)),
+            linearSpacing * melPoints)
+        let fftFrequencies = MLX.linspace(
+            Float(0), Float(sampleRate / 2), count: numBins).asType(.float32)
+        let differences = frequencyPoints[1...] - frequencyPoints[..<(nMels + 1)]
+        let slopes = frequencyPoints.expandedDimensions(axis: 0)
+            - fftFrequencies.expandedDimensions(axis: 1)
+        let downSlopes = -slopes[0..., ..<nMels] / differences[..<nMels]
+        let upSlopes = slopes[0..., 2...] / differences[1...]
+        let triangles = maximum(MLXArray(Float(0)), minimum(downSlopes, upSlopes))
+        let areaNormalization = 2.0 / (frequencyPoints[2...] - frequencyPoints[..<nMels])
+        return triangles * areaNormalization.expandedDimensions(axis: 0)
     }
 }

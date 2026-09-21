@@ -696,9 +696,8 @@ public class Qwen3TTSModel {
         let waveform = codecDecoder.executeDecoder(codes)  // [1, T_samples, 1]
 
         // Keep the last `realChunkFrames * samplesPerFrame` samples from the decoder output.
-        // The decoder has a ~2880-sample startup overhead (causal conv warmup), so trimming
-        // from the left by `(zeroPad + context) * samplesPerFrame` can overshoot. Instead,
-        // compute the desired output size and trim from the right side of the waveform.
+        // The corrected codec emits 1920 samples per frame. Keeping the target
+        // tail removes both prepended minimum-length padding and left context.
         let realChunkFrames = chunkEnd - chunkStart
         let expectedKept = realChunkFrames * samplesPerFrame
         let totalSamples = waveform.dim(1)
