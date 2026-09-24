@@ -109,7 +109,13 @@ extension Qwen3TTSModel {
             checkCancellation: { try Task.checkCancellation() })
     }
 
-    private func synthesizeWithVoiceCloneICL(
+    /// Progressive decoding of unchanged ICL codec generation.
+    /// Emits newly decoded PCM at each 24-frame prefix and the remaining tail
+    /// at completion, while returning the complete final decode for comparison.
+    /// Callers must serialize inference/unload and retain ownership until return,
+    /// including after cancellation. Prefix-edge parity and playback inventory
+    /// must be qualified when changing the model, reference or decoder recipe.
+    public func synthesizeWithVoiceCloneICLProgressively(
         text: String,
         referenceAudio: [Float],
         referenceSampleRate: Int = 24000,
@@ -118,34 +124,22 @@ extension Qwen3TTSModel {
         sampling: SamplingConfig = .default,
         codecEncoder: SpeechTokenizerEncoder,
         trimReference: Bool = true,
+        onAudio: @escaping ([Float]) -> Void
+    ) throws -> [Float] {
+        try synthesizeWithVoiceCloneICL(
+            text: text, referenceAudio: referenceAudio,
+            referenceSampleRate: referenceSampleRate, referenceText: referenceText,
+            language: language, sampling: sampling, codecEncoder: codecEncoder,
+            trimReference: trimReference,
+            checkCancellation: { try Task.checkCancellation() }, onAudio: onAudio)
+    }
+
+    private func preparedVoiceCloneReference(
+        referenceAudio: [Float],
+        referenceSampleRate: Int,
+        codecEncoder: SpeechTokenizerEncoder,
         checkCancellation: () throws -> Void
-    ) rethrows -> [Float] {
-        try checkCancellation()
-        guard let tokenizer = tokenizer else {
-            fatalError("Tokenizer not loaded")
-        }
-        // "auto" (matches the QwenLM reference + mlx-audio default) skips the
-        // language-id token and switches the codec prefix to the codec_nothink
-        // branch. Any other value must resolve to a known language id.
-        let langId: Int?
-        let normalized = language.lowercased()
-        if normalized == "auto" || normalized.isEmpty {
-            langId = nil
-        } else if let id = CodecTokens.languageId(for: language) {
-            langId = id
-        } else {
-            AudioLog.inference.warning(
-                "Unknown language '\(language, privacy: .private)', falling back to auto")
-            return try synthesizeWithVoiceCloneICL(
-                text: text, referenceAudio: referenceAudio,
-                referenceSampleRate: referenceSampleRate,
-                referenceText: referenceText, language: "auto",
-                sampling: sampling, codecEncoder: codecEncoder,
-                trimReference: trimReference, checkCancellation: checkCancellation)
-        }
-
-        let t0 = CFAbsoluteTimeGetCurrent()
-
+    ) rethrows -> (refCodes: MLXArray, speakerEmbed: MLXArray) {
         // Step 1+2: Encode reference audio → codec tokens [1, 16, T_ref] (cached per reference)
         let refCodes: MLXArray
         if let cached = referenceAudioCache.codecRefCodes(for: referenceAudio, sampleRate: referenceSampleRate) {
@@ -184,6 +178,52 @@ extension Qwen3TTSModel {
 
         try checkCancellation()
 
+        return (refCodes, speakerEmbed)
+    }
+
+    private func synthesizeWithVoiceCloneICL(
+        text: String,
+        referenceAudio: [Float],
+        referenceSampleRate: Int = 24000,
+        referenceText: String,
+        language: String = "auto",
+        sampling: SamplingConfig = .default,
+        codecEncoder: SpeechTokenizerEncoder,
+        trimReference: Bool = true,
+        checkCancellation: @escaping () throws -> Void,
+        onAudio: (([Float]) -> Void)? = nil
+    ) rethrows -> [Float] {
+        try checkCancellation()
+        guard let tokenizer = tokenizer else {
+            fatalError("Tokenizer not loaded")
+        }
+        // "auto" (matches the QwenLM reference + mlx-audio default) skips the
+        // language-id token and switches the codec prefix to the codec_nothink
+        // branch. Any other value must resolve to a known language id.
+        let langId: Int?
+        let normalized = language.lowercased()
+        if normalized == "auto" || normalized.isEmpty {
+            langId = nil
+        } else if let id = CodecTokens.languageId(for: language) {
+            langId = id
+        } else {
+            AudioLog.inference.warning(
+                "Unknown language '\(language, privacy: .private)', falling back to auto")
+            return try synthesizeWithVoiceCloneICL(
+                text: text, referenceAudio: referenceAudio,
+                referenceSampleRate: referenceSampleRate,
+                referenceText: referenceText, language: "auto",
+                sampling: sampling, codecEncoder: codecEncoder,
+                trimReference: trimReference, checkCancellation: checkCancellation,
+                onAudio: onAudio)
+        }
+
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        let (refCodes, speakerEmbed) = try preparedVoiceCloneReference(
+            referenceAudio: referenceAudio, referenceSampleRate: referenceSampleRate,
+            codecEncoder: codecEncoder, checkCancellation: checkCancellation)
+
         // Step 4: Build ICL prefill embeddings
         let (prefillEmbeds, trailingTextHidden, ttsPadEmbed) = buildICLPrefillEmbeddings(
             refCodes: refCodes,
@@ -215,12 +255,39 @@ extension Qwen3TTSModel {
         let targetTokenCount = tokenizer.encode(text).count
         let textDerivedCap = max(96, targetTokenCount * 8)
         iclSampling.maxTokens = min(iclSampling.maxTokens, textDerivedCap)
-        let (allCodebooks, numFrames) = try generateWithCodePredictor(
-            prefillEmbeds: prefillEmbeds,
-            trailingTextHidden: trailingTextHidden,
-            ttsPadEmbed: ttsPadEmbed,
-            sampling: iclSampling,
-            checkCancellation: checkCancellation)
+        var emittedSampleCount = 0
+        let allCodebooks: MLXArray
+        let numFrames: Int
+        if let onAudio {
+            (allCodebooks, numFrames) = try generateWithCodePredictor(
+                prefillEmbeds: prefillEmbeds,
+                trailingTextHidden: trailingTextHidden,
+                ttsPadEmbed: ttsPadEmbed,
+                sampling: iclSampling,
+                checkCancellation: checkCancellation,
+                onGeneratedPrefix: { prefix in
+                    try checkCancellation()
+                    let prefixCodes = trimReference
+                        ? concatenated([refCodes, prefix], axis: 2) : prefix
+                    let waveform = try self.codecDecoder.decode(
+                        codes: prefixCodes, chunkSize: 300, leftContext: 25,
+                        startFrame: trimReference ? refCodes.dim(2) : 0,
+                        checkCancellation: checkCancellation)
+                    try checkCancellation()
+                    if waveform.count > emittedSampleCount {
+                        onAudio(Array(waveform[emittedSampleCount...]))
+                        emittedSampleCount = waveform.count
+                    }
+                    try checkCancellation()
+                })
+        } else {
+            (allCodebooks, numFrames) = try generateWithCodePredictor(
+                prefillEmbeds: prefillEmbeds,
+                trailingTextHidden: trailingTextHidden,
+                ttsPadEmbed: ttsPadEmbed,
+                sampling: iclSampling,
+                checkCancellation: checkCancellation)
+        }
 
         eval(allCodebooks)
         try checkCancellation()
@@ -261,6 +328,10 @@ extension Qwen3TTSModel {
             "ICL timing: encode=\(encTime, privacy: .public)s | generate=\(genTime, privacy: .public)s (\(numFrames, privacy: .public) steps, \(msPerStep, privacy: .public)ms/step) | decode=\(decTime, privacy: .public)s | total=\(totTime, privacy: .public)s | audio=\(audDur, privacy: .public)s | RTF=\(rtf, privacy: .public)")
 
         try checkCancellation()
+        if let onAudio, trimmedWaveform.count > emittedSampleCount {
+            onAudio(Array(trimmedWaveform[emittedSampleCount...]))
+            try checkCancellation()
+        }
         return trimmedWaveform
     }
 

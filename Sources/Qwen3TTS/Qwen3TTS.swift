@@ -1592,7 +1592,8 @@ public class Qwen3TTSModel {
         trailingTextHidden: MLXArray,
         ttsPadEmbed: MLXArray,
         sampling: SamplingConfig,
-        checkCancellation: () throws -> Void
+        checkCancellation: () throws -> Void,
+        onGeneratedPrefix: ((MLXArray) throws -> Void)? = nil
     ) rethrows -> (allCodebooks: MLXArray, numFrames: Int) {
         try checkCancellation()
 
@@ -1698,6 +1699,20 @@ public class Qwen3TTSModel {
             try checkCancellation()
             for (i, token) in codeTokens.enumerated() {
                 generatedAllCodebooks[i + 1].append(token)
+            }
+
+            // Prototype observer only: nil retains the original generation path.
+            // Each callback sees complete 16-codebook frames, without changing
+            // sampling, talker state or the final codebook accumulation.
+            if let onGeneratedPrefix, generatedFirstCodebook.count % 24 == 0 {
+                try checkCancellation()
+                let prefixArrays = generatedAllCodebooks.map { tokens in
+                    MLXArray(tokens).expandedDimensions(axis: 0)
+                }
+                let prefix = stacked(prefixArrays, axis: 1)
+                eval(prefix)
+                try onGeneratedPrefix(prefix)
+                try checkCancellation()
             }
 
             step += 1
