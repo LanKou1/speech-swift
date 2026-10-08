@@ -393,3 +393,21 @@ let audio = try model.synthesize(text: "Hello world", language: "english")
 ```bash
 speech speak "Hello world" --engine coreml --output hello.wav
 ```
+
+### Local clone bundle validation
+
+`TTSWeightLoader.validateCloneWeightSet(modelDirectory:codecDirectory:)` performs
+synchronous structural validation without allocating a model or loading tensor
+payloads. It checks safetensors byte extents and duplicate shard keys, then checks
+every parameter used by the talker, code predictor, speaker encoder, decoder and
+reference encoder against the package architecture. Packed linear weights must
+match the configured bit width and group size and have complete affine triplets;
+the text embedding may use its own coherent quantization width. Floating tensors
+must have one dtype within each component, so an F16 decoder with an unchanged
+F32 reference encoder is valid. This does not authenticate a checkpoint's origin
+or detect arbitrary finite-value corruption within an otherwise valid payload.
+
+The decoder loader also rejects incomplete, inconsistent or wrongly shaped
+weights before applying parameters. F16 decode math is selected only after every
+required decoder convolution has been validated as F16. Valid weights retain the
+same parameter transformations and decode behavior.

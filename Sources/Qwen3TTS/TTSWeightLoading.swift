@@ -226,6 +226,8 @@ public enum TTSWeightLoader {
         into decoder: SpeechTokenizerDecoder,
         from directory: URL
     ) throws {
+        let headers = try readWeightHeaders(from: directory)
+        let computesInFloat16 = try validateDecoderWeights(headers, config: decoder.config)
         let allWeights = try CommonWeightLoader.loadAllSafetensors(from: directory)
 
         logLoad("Found \(allWeights.count) speech tokenizer weights total")
@@ -278,7 +280,7 @@ public enum TTSWeightLoader {
         CommonWeightLoader.applyConv1dWeights(
             to: decoder.finalConv.conv, prefix: "decoder.decoder.6.conv", from: allWeights, transpose: true)
 
-        decoder.computesInFloat16 = decoder.finalConv.conv.weight.dtype == .float16
+        decoder.computesInFloat16 = computesInFloat16
         logLoad("Applied weights to Speech Tokenizer Decoder")
     }
 
