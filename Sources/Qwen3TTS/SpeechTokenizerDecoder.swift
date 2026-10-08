@@ -654,6 +654,91 @@ public class SpeechTokenizerDecoder: Module {
         eval(result)
     }
 
+    // MARK: - Bounded decode (low-rate half + convolutional half)
+
+    /// Frames of latent context the convolutional half needs: its causal
+    /// receptive field is about 12 codec frames, rounded up.
+    public static let convolutionContextFrames = 16
+
+    /// True when the decoder weights were loaded as float16: the convolutional
+    /// half then computes in float16 too (its input is cast; MLX would promote
+    /// back to float32 otherwise). Set by `loadSpeechTokenizerDecoderWeights`.
+    public internal(set) var computesInFloat16 = false
+
+    /// The low-rate half of `callAsFunction`: RVQ, pre-conv and the
+    /// transformer, the only part with long (full causal) context.
+    public func latent(_ codes: MLXArray) -> MLXArray {
+        transformer(preConv(splitRVQ.decode(codes)))
+    }
+
+    /// The convolutional half of `callAsFunction`.
+    public func upsample(_ latent: MLXArray) -> MLXArray {
+        var h = preConvNeXt1(preUpsample1(latent))
+        h = preConvNeXt2(preUpsample2(h))
+        h = inputConv(h)
+        for block in decoderBlocks { h = block(h) }
+        return clip(finalConv(finalSnake(h)), min: -1.0, max: 1.0)
+    }
+
+    private var compiledUpsample: (([MLXArray]) -> [MLXArray])?
+
+    /// `upsample`, compiled per input shape when compilation is set up.
+    func executeUpsample(_ latent: MLXArray) -> MLXArray {
+        let input = computesInFloat16 ? latent.asType(.float16) : latent
+        guard compiledDecoder != nil else { return upsample(input) }
+        if compiledUpsample == nil {
+            let selfRef = self
+            compiledUpsample = compile(inputs: [selfRef], outputs: [selfRef], shapeless: false) { inputs in
+                [selfRef.upsample(inputs[0])]
+            }
+        }
+        return compiledUpsample!([input])[0]
+    }
+
+    /// Samples for absolute frames [from, total) of `codes`, equal (up to
+    /// float rounding) to `chunkedDecode(codes, chunkSize: 300, leftContext: 25)`
+    /// over that range, with bounded memory. The transformer runs on the same
+    /// 300/25 chunk context as the chunked decode; the convolutional half — the
+    /// high-rate activations that set the peak — runs on at most `step` new
+    /// frames at a time plus `convolutionContextFrames` frames of context.
+    public func decodeBounded(
+        codes: MLXArray, from: Int, total: Int, step: Int,
+        checkCancellation: () throws -> Void
+    ) rethrows -> [Float] {
+        precondition(step > 0 && from >= 0 && from <= total && total <= codes.dim(2))
+        let context = Self.convolutionContextFrames
+        var samples: [Float] = []
+        var start = from
+        while start < total {
+            try checkCancellation()
+            let chunkStart = (start / 300) * 300
+            let chunkEnd = min(chunkStart + 300, total)
+            let latentStart = max(chunkStart - 25, 0)
+            let latent = latent(codes[0..., 0..., latentStart..<chunkEnd])
+            eval(latent)
+            var stepStart = start
+            while stepStart < chunkEnd {
+                let stepEnd = stepStart + min(step, chunkEnd - stepStart)
+                let convStart = max(stepStart - context, latentStart)
+                let wave = executeUpsample(latent[0..., (convStart - latentStart)..<(stepEnd - latentStart), 0...])
+                let kept = wave[0..., ((stepStart - convStart) * 1920)..., 0...].squeezed()
+                eval(kept)
+                try checkCancellation()
+                samples += kept.asArray(Float.self)
+                stepStart = stepEnd
+            }
+            start = chunkEnd
+        }
+        return samples
+    }
+
+    /// Trace the bounded decode's common shape (and compile it) at load time.
+    public func warmUpBounded(step: Int) {
+        let frames = step + Self.convolutionContextFrames
+        let latent = latent(MLXArray.zeros([1, 16, frames]).asType(.int32))
+        eval(executeUpsample(latent))
+    }
+
     /// Decode codebook indices to audio waveform
     public func callAsFunction(_ codes: MLXArray) -> MLXArray {
         // RVQ decode: [B, 16, T] -> [B, T, 512]

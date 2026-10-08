@@ -10,6 +10,27 @@ import os
 
 extension Qwen3TTSModel {
 
+    /// The prepared clone reference — codec tokens and speaker embedding — once
+    /// a synthesis has computed it, so a caller can save it.
+    public func preparedVoiceCloneReference(
+        referenceAudio: [Float], referenceSampleRate: Int
+    ) -> (codes: MLXArray, speakerEmbed: MLXArray)? {
+        guard let codes = referenceAudioCache.codecRefCodes(for: referenceAudio, sampleRate: referenceSampleRate),
+              let embed = referenceAudioCache.speakerEmbed(for: referenceAudio, sampleRate: referenceSampleRate)
+        else { return nil }
+        return (codes, embed)
+    }
+
+    /// Seed the reference cache with saved tokens and embedding, so neither the
+    /// codec encoder nor the speaker encoder runs (their lazily loaded weights
+    /// are then never materialized).
+    public func primeVoiceCloneReference(
+        referenceAudio: [Float], referenceSampleRate: Int, codes: MLXArray, speakerEmbed: MLXArray
+    ) {
+        referenceAudioCache.storeCodecRefCodes(codes, audio: referenceAudio, sampleRate: referenceSampleRate)
+        referenceAudioCache.storeSpeakerEmbed(speakerEmbed, audio: referenceAudio, sampleRate: referenceSampleRate)
+    }
+
     /// Load a Qwen3-TTS model together with the SpeechTokenizerEncoder for ICL voice cloning.
     ///
     /// The encoder is used to convert reference audio into codec tokens. Weights come from
@@ -111,7 +132,10 @@ extension Qwen3TTSModel {
 
     /// Progressive decoding of unchanged ICL codec generation.
     /// Emits newly decoded PCM at each 24-frame prefix and the remaining tail
-    /// at completion, while returning the complete final decode for comparison.
+    /// at completion, and returns only that tail (every earlier sample was
+    /// emitted). Each emission decodes only its new frames, with bounded memory
+    /// (`SpeechTokenizerDecoder.decodeBounded`), and matches the original
+    /// 300/25 chunked decode of the whole take up to float rounding.
     /// Callers must serialize inference/unload and retain ownership until return,
     /// including after cancellation. Prefix-edge parity and playback inventory
     /// must be qualified when changing the model, reference or decoder recipe.
@@ -256,6 +280,10 @@ extension Qwen3TTSModel {
         let textDerivedCap = max(96, targetTokenCount * 8)
         iclSampling.maxTokens = min(iclSampling.maxTokens, textDerivedCap)
         var emittedSampleCount = 0
+        // Frames after the reference whose audio has been emitted.
+        var emittedFrames = 0
+        let referenceFrames = trimReference ? refCodes.dim(2) : 0
+        let step = max(1, cloneDecodeStep)
         let allCodebooks: MLXArray
         let numFrames: Int
         if let onAudio {
@@ -269,15 +297,16 @@ extension Qwen3TTSModel {
                     try checkCancellation()
                     let prefixCodes = trimReference
                         ? concatenated([refCodes, prefix], axis: 2) : prefix
-                    let waveform = try self.codecDecoder.decode(
-                        codes: prefixCodes, chunkSize: 300, leftContext: 25,
-                        startFrame: trimReference ? refCodes.dim(2) : 0,
-                        checkCancellation: checkCancellation)
+                    // Only the frames not yet emitted, with bounded memory —
+                    // not the reference tail and the whole prefix again.
+                    let total = prefixCodes.dim(2)
+                    let samples = try self.codecDecoder.decodeBounded(
+                        codes: prefixCodes, from: referenceFrames + emittedFrames, total: total,
+                        step: step, checkCancellation: checkCancellation)
                     try checkCancellation()
-                    if waveform.count > emittedSampleCount {
-                        onAudio(Array(waveform[emittedSampleCount...]))
-                        emittedSampleCount = waveform.count
-                    }
+                    emittedFrames = total - referenceFrames
+                    emittedSampleCount += samples.count
+                    if !samples.isEmpty { onAudio(samples) }
                     try checkCancellation()
                 })
         } else {
@@ -309,14 +338,16 @@ extension Qwen3TTSModel {
         AudioLog.inference.debug(
             "ICL: decoding \(numFrames, privacy: .public) target frames (+ \(trimReference ? refFrames : 0, privacy: .public) ref ctx) → \(totalFrames, privacy: .public) frames")
         try checkCancellation()
-        let trimmedWaveform = try codecDecoder.decode(
-            codes: codesForDecode, chunkSize: 300, leftContext: 25,
-            startFrame: trimReference ? refFrames : 0,
+        // Progressive callers already received every frame but the tail; the
+        // one-shot path decodes the whole take, both with bounded memory.
+        let decodedFrom = onAudio == nil ? referenceFrames : referenceFrames + emittedFrames
+        let tail = try codecDecoder.decodeBounded(
+            codes: codesForDecode, from: decodedFrom, total: totalFrames, step: step,
             checkCancellation: checkCancellation)
         try checkCancellation()
         let t3 = CFAbsoluteTimeGetCurrent()
 
-        let audioDur = Double(trimmedWaveform.count) / 24000.0
+        let audioDur = Double(emittedSampleCount + tail.count) / 24000.0
         let encTime = String(format: "%.3f", t1-t0)
         let genTime = String(format: "%.3f", t2-t1)
         let msPerStep = String(format: "%.0f", (t2-t1)/Double(max(numFrames, 1))*1000)
@@ -328,11 +359,11 @@ extension Qwen3TTSModel {
             "ICL timing: encode=\(encTime, privacy: .public)s | generate=\(genTime, privacy: .public)s (\(numFrames, privacy: .public) steps, \(msPerStep, privacy: .public)ms/step) | decode=\(decTime, privacy: .public)s | total=\(totTime, privacy: .public)s | audio=\(audDur, privacy: .public)s | RTF=\(rtf, privacy: .public)")
 
         try checkCancellation()
-        if let onAudio, trimmedWaveform.count > emittedSampleCount {
-            onAudio(Array(trimmedWaveform[emittedSampleCount...]))
+        if let onAudio {
+            if !tail.isEmpty { onAudio(tail) }
             try checkCancellation()
         }
-        return trimmedWaveform
+        return tail
     }
 
     // MARK: - ICL Prefill Construction

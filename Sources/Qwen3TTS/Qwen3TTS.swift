@@ -47,6 +47,12 @@ public class Qwen3TTSModel {
     /// ECAPA-TDNN speaker encoder for voice cloning (Base model only)
     public let speakerEncoder: SpeakerEncoder
 
+    /// New codec frames the voice-clone decode runs through the decoder's
+    /// convolutional half at a time. Smaller lowers the peak memory of each
+    /// decode and costs some speed (8: ~0.7 GB less than 24 at a 0.6B clone's
+    /// float32 math; the output is the same either way).
+    public var cloneDecodeStep = 8
+
     /// Speaker configuration parsed from config.json (nil for Base model, populated for CustomVoice)
     public private(set) var speakerConfig: SpeakerConfig?
 
@@ -1189,7 +1195,14 @@ public class Qwen3TTSModel {
         // compile() fuses multiple kernel dispatches into fewer optimized kernels per chunk.
         // Warmup adds ~300ms to load time but saves on every generation.
         codecDecoder.setupCompilation()
-        codecDecoder.warmUp()
+        if availableSpeakers.isEmpty {
+            // Base (voice-clone) bundles decode through `decodeBounded` only;
+            // the full decoder's [1, 16, 35] warm-up would cost the bigger
+            // transient at load for a shape these bundles never use.
+            codecDecoder.warmUpBounded(step: cloneDecodeStep)
+        } else {
+            codecDecoder.warmUp()
+        }
     }
 
     // MARK: - Compiled Generation Steps

@@ -67,9 +67,23 @@ public enum TTSWeightLoader {
         CommonWeightLoader.applyEmbeddingWeights(
             to: talker.codecEmbedding, prefix: "model.codec_embedding", from: talkerWeights)
 
-        // Text embedding (float, not quantized)
-        CommonWeightLoader.applyEmbeddingWeights(
-            to: talker.textEmbedding, prefix: "model.text_embedding", from: talkerWeights)
+        // Text embedding: float, or affine-quantized when the bundle carries
+        // its scales and biases (a 151936x2048 table is ~620 MB at bfloat16).
+        if let weight = talkerWeights["model.text_embedding.weight"],
+           let scales = talkerWeights["model.text_embedding.scales"],
+           let biases = talkerWeights["model.text_embedding.biases"] {
+            let dims = talker.config.textHiddenSize
+            let groupSize = dims / scales.dim(1)
+            let quantized = QuantizedEmbedding(
+                weight: MLXArray.zeros([1, groupSize]), groupSize: groupSize, bits: weight.dim(1) * 32 / dims)
+            quantized.update(parameters: ModuleParameters(values: [
+                "weight": .value(weight), "scales": .value(scales), "biases": .value(biases)]))
+            talker.update(modules: ModuleChildren(values: ["textEmbedding": .value(quantized)]))
+            logLoad("Text embedding: \(quantized.bits)-bit, group \(groupSize)")
+        } else {
+            CommonWeightLoader.applyEmbeddingWeights(
+                to: talker.textEmbedding, prefix: "model.text_embedding", from: talkerWeights)
+        }
 
         // Text projection MLP (safetensors keys use "linear_fc1"/"linear_fc2")
         CommonWeightLoader.applyQuantizedLinearWeights(
@@ -264,6 +278,7 @@ public enum TTSWeightLoader {
         CommonWeightLoader.applyConv1dWeights(
             to: decoder.finalConv.conv, prefix: "decoder.decoder.6.conv", from: allWeights, transpose: true)
 
+        decoder.computesInFloat16 = decoder.finalConv.conv.weight.dtype == .float16
         logLoad("Applied weights to Speech Tokenizer Decoder")
     }
 
